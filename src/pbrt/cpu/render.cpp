@@ -68,6 +68,8 @@ void RenderCPU(BasicScene &parsedScene) {
 
     if (haveScatteringMedia && parsedScene.integrator.name != "volpath" &&
         parsedScene.integrator.name != "simplevolpath" &&
+        parsedScene.integrator.name != "simplevolpathdelta" &&
+        parsedScene.integrator.name != "biasedvolpathdelta" &&
         parsedScene.integrator.name != "bdpt" && parsedScene.integrator.name != "mlt")
         Warning("Scene has scattering media but \"%s\" integrator doesn't support "
                 "volume scattering. Consider using \"volpath\", \"simplevolpath\", "

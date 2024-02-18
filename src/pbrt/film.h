@@ -242,7 +242,7 @@ class RGBFilm : public FilmBase {
         RGB rgb = sensor->ToSensorRGB(L, lambda);
 
         // Optionally clamp sensor RGB value
-        Float m = std::max({rgb.r, rgb.g, rgb.b});
+        Float m = std::max({std::abs(rgb.r), std::abs(rgb.g), std::abs(rgb.b)});
         if (m > maxComponentValue)
             rgb *= maxComponentValue / m;
 
@@ -252,6 +252,25 @@ class RGBFilm : public FilmBase {
         for (int c = 0; c < 3; ++c)
             pixel.rgbSum[c] += weight * rgb[c];
         pixel.weightSum += weight;
+    }
+
+    PBRT_CPU_GPU
+    void AddSample_noweight(Point2i pFilm, SampledSpectrum L, const SampledWavelengths &lambda,
+                   const VisibleSurface *, Float weight) {
+        // Convert sample radiance to _PixelSensor_ RGB
+        RGB rgb = sensor->ToSensorRGB(L, lambda);
+
+        // Optionally clamp sensor RGB value
+        Float m = std::max({std::abs(rgb.r), std::abs(rgb.g), std::abs(rgb.b)});
+        if (m > maxComponentValue )
+            rgb *= maxComponentValue / m;
+
+        DCHECK(InsideExclusive(pFilm, pixelBounds));
+        // Update pixel values with filtered sample contribution
+        Pixel &pixel = pixels[pFilm];
+        for (int c = 0; c < 3; ++c)
+            pixel.rgbSum[c] += weight * rgb[c];
+        //pixel.weightSum += weight;
     }
 
     PBRT_CPU_GPU

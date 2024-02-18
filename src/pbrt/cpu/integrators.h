@@ -103,8 +103,8 @@ class RayIntegrator : public ImageTileIntegrator {
                   std::vector<Light> lights)
         : ImageTileIntegrator(camera, sampler, aggregate, lights) {}
 
-    void EvaluatePixelSample(Point2i pPixel, int sampleIndex, Sampler sampler,
-                             ScratchBuffer &scratchBuffer) final;
+    virtual void EvaluatePixelSample(Point2i pPixel, int sampleIndex, Sampler sampler,
+                             ScratchBuffer &scratchBuffer) ;
 
     virtual SampledSpectrum Li(RayDifferential ray, SampledWavelengths &lambda,
                                Sampler sampler, ScratchBuffer &scratchBuffer,
@@ -256,6 +256,144 @@ class SimpleVolPathIntegrator : public RayIntegrator {
     // SimpleVolPathIntegrator Private Members
     int maxDepth;
 };
+
+// Quack Quack!
+
+// SimpleVolPathDeltaIntegrator Definition
+class SimpleVolPathDeltaIntegrator : public RayIntegrator {
+  public:
+    // SimpleVolPathDeltaIntegrator Public Methods
+    SimpleVolPathDeltaIntegrator(int maxDepth, Camera camera, Sampler sampler,
+                                 Primitive aggregate, std::vector<Light> lights);
+
+    SampledSpectrum Li(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+    
+    SampledSpectrum Li_ori(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface, int cur_depth=0) const;
+
+    SampledSpectrum Li_naive(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_exp(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_new(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_large(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_biased(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_urm(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_ris(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_large_urm(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_dtrk(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    SampledSpectrum Li_delta_dtrk_exp(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+    
+    SampledSpectrum Li_delta_large_dtrk(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    struct Reservoir_sigmaT{
+      Float w_tot = 0.;
+      Float p_hat = 0.;
+      Point3f location;
+      MediumProperties mp;
+      bool isInside;
+
+      void addSample(Float w, Float pr, Point3f point, MediumProperties mpp, bool f, Float u){
+        w_tot += w;
+        if(u < w / w_tot){
+          p_hat = pr;
+          location = point;
+          mp = mpp;
+          isInside = f;
+        }
+      }
+    };
+
+    void Tr_urm(Ray ray, Float tMax, const SampledWavelengths &lambda, ScratchBuffer &scratchbuffer, RNG &rng, Float &Tr_old, Float &Tr_new, Float ODepth_maj) const;
+
+    // virtual void EvaluatePixelSample(Point2i pPixel, int sampleIndex, Sampler sampler,
+    //                          ScratchBuffer &scratchBuffer) override;
+
+    void Render() override;
+
+    void EvaluatePixelSample_ori(Point2i pPixel, int sampleIndex, Sampler sampler,
+                                 ScratchBuffer &scratchBuffer) ;
+
+    void EvaluatePixelSample_delta(Point2i pPixel, int sampleIndex, Sampler sampler,
+                                   ScratchBuffer &scratchBuffer, int spp) ;
+
+    static std::unique_ptr<SimpleVolPathDeltaIntegrator> Create(
+        const ParameterDictionary &parameters, Camera camera, Sampler sampler,
+        Primitive aggregate, std::vector<Light> lights, const FileLoc *loc);
+
+    std::string ToString() const;
+
+  private:
+    // SimpleVolPathDeltaIntegrator Private Members
+    int maxDepth;
+};
+
+
+// Quack Quack!
+
+// BiasedVolPathDeltaIntegrator Definition
+class BiasedVolPathDeltaIntegrator : public RayIntegrator {
+  public:
+    // BiasedVolPathDeltaIntegrator Public Methods
+    BiasedVolPathDeltaIntegrator(int maxDepth, Camera camera, Sampler sampler,
+                                 Primitive aggregate, std::vector<Light> lights);
+
+    SampledSpectrum Li(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
+                       ScratchBuffer &scratchBuffer,
+                       VisibleSurface *visibleSurface) const;
+
+    bool InvertDensityIntegral_Simpson(Ray ray, Float tMax, Float desiredDensity, const SampledWavelengths &lambda,
+                               Float &densityAtT, Point3f &p_scatter) const;
+
+    void Tr_urm(Ray ray, Float tMax, const SampledWavelengths &lambda, ScratchBuffer &scratchbuffer, RNG &rng, Float &Tr_old, Float &Tr_new, Float ODepth_maj) const;
+
+    static std::unique_ptr<BiasedVolPathDeltaIntegrator> Create(
+        const ParameterDictionary &parameters, Camera camera, Sampler sampler,
+        Primitive aggregate, std::vector<Light> lights, const FileLoc *loc);
+
+    std::string ToString() const;
+
+  private:
+    // BiasedVolPathDeltaIntegrator Private Members
+    int maxDepth;
+};
+
 
 // VolPathIntegrator Definition
 class VolPathIntegrator : public RayIntegrator {

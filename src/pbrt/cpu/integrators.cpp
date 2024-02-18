@@ -946,6 +946,3671 @@ std::unique_ptr<SimpleVolPathIntegrator> SimpleVolPathIntegrator::Create(
                                                      lights);
 }
 
+// Quack Quack!
+
+// SimpleVolPathDeltaIntegrator Method Definitions
+SimpleVolPathDeltaIntegrator::SimpleVolPathDeltaIntegrator(int maxDepth, Camera camera,
+                                                           Sampler sampler, Primitive aggregate,
+                                                           std::vector<Light> lights)
+    : RayIntegrator(camera, sampler, aggregate, lights), maxDepth(maxDepth) {
+    for (Light light : lights) {
+        if (IsDeltaLight(light.Type()))
+            ErrorExit("SimpleVolPathIntegrator only supports area and infinite light "
+                      "sources");
+    }
+}
+
+std::string SimpleVolPathDeltaIntegrator::ToString() const {
+    return StringPrintf("[ SimpleVolPathDeltaIntegrator maxDepth: %d ] ", maxDepth);
+}
+
+std::unique_ptr<SimpleVolPathDeltaIntegrator> SimpleVolPathDeltaIntegrator::Create(
+    const ParameterDictionary &parameters, Camera camera, Sampler sampler,
+    Primitive aggregate, std::vector<Light> lights, const FileLoc *loc) {
+    int maxDepth = parameters.GetOneInt("maxdepth", 5);
+    return std::make_unique<SimpleVolPathDeltaIntegrator>(maxDepth, camera, sampler, aggregate,
+                                                          lights);
+}
+
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_ori(RayDifferential ray,
+                                                     SampledWavelengths &lambda, Sampler sampler,
+                                                     ScratchBuffer &buf, VisibleSurface *, int cur_depth) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum L(0.f);
+    Float beta = 1.f;
+    int depth = cur_depth;
+
+    // Terminate secondary wavelengths before starting random walk; really needed here?
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        bool scattered = false, terminated = false;
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // Sample medium using delta tracking
+            Float tMax = si ? si->tHit : Infinity;
+            Float u = sampler.Get1D();
+            Float uMode = sampler.Get1D();
+            SampleT_maj_old(ray, tMax, u, rng, lambda,
+                            [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                            SampledSpectrum T_maj) {
+                            MediumProperties mp=vmp[0];
+                            // Compute medium event probabilities for interaction
+                            Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                            Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                            Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                            // Randomly sample medium scattering event for delta tracking
+                            int mode = SampleDiscrete({pAbsorb, pScatter, pNull}, uMode);
+                            if (mode == 0) {
+                                // Handle absorption event for medium sample
+                                L += beta * mp.Le;
+                                terminated = true;
+                                return false;
+
+                            } else if (mode == 1) {
+                                // Handle regular scattering event for medium sample
+                                // Stop path sampling if maximum depth has been reached
+                                if (depth++ >= maxDepth) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Sample phase function for medium scattering event
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =
+                                    mp.phase.Sample_p(-ray.d, u);
+                                if (!ps) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Update state for recursive evaluation of $L_\roman{i}$
+                                beta *= ps->p / ps->pdf;
+                                ray.o = p;
+                                ray.d = ps->wi;
+                                scattered = true;
+                                return false;
+
+                            } else {
+                                // Handle null-scattering event for medium sample
+                                uMode = rng.Uniform<Float>();
+                                return true;
+                            }
+                        });
+        }
+        // Handle terminated and unscattered rays after medium sampling
+        if (terminated){
+            //LOG_VERBOSE("Li_ori=%s\n",L);
+            return L;
+        }
+        if (scattered)
+            continue;
+        // Add emission to surviving ray
+        if (si)
+            L += beta * si->intr.Le(-ray.d, lambda);
+        else {
+            for (const auto &light : infiniteLights)
+                L += beta * light.Le(ray, lambda);
+            //LOG_VERBOSE("Li_ori=%s\n",L);
+            return L;
+        }
+
+        // Handle surface intersection along ray path
+        BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+        if (!bsdf)
+            si->intr.SkipIntersection(&ray, si->tHit);
+        else {
+            // Report error if BSDF returns a valid sample
+            Float uc = sampler.Get1D();
+            Point2f u = sampler.Get2D();
+            if (bsdf.Sample_f(-ray.d, uc, u))
+                ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+            else
+                break;
+        }
+    }
+    //LOG_VERBOSE("Li_ori=%s\n",L);
+    return L;
+}
+
+/*
+void SimpleVolPathDeltaIntegrator::EvaluatePixelSample(Point2i pPixel, int sampleIndex, Sampler sampler,
+                                                       ScratchBuffer &scratchBuffer) {
+    // Sample wavelengths for the ray
+    Float lu = sampler.Get1D();
+    if (Options->disableWavelengthJitter)
+        lu = 0.5;
+    SampledWavelengths lambda = camera.GetFilm().SampleWavelengths(lu);
+
+    // Initialize _CameraSample_ for current sample
+    Filter filter = camera.GetFilm().GetFilter();
+    CameraSample cameraSample = GetCameraSample(sampler, pPixel, filter);
+
+    // Generate camera ray for current sample
+    pstd::optional<CameraRayDifferential> cameraRay =
+        camera.GenerateRayDifferential(cameraSample, lambda);
+
+    // Trace _cameraRay_ if valid
+    SampledSpectrum L(0.);
+    VisibleSurface visibleSurface;
+    if (cameraRay) {
+        // Double check that the ray's direction is normalized.
+        DCHECK_GT(Length(cameraRay->ray.d), .999f);
+        DCHECK_LT(Length(cameraRay->ray.d), 1.001f);
+        // Scale camera ray differentials based on image sampling rate
+        Float rayDiffScale =
+            std::max<Float>(.125f, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+        if (!Options->disablePixelJitter)
+            cameraRay->ray.ScaleDifferentials(rayDiffScale);
+
+        ++nCameraRays;
+        // Evaluate radiance along camera ray: first sample Li_ori
+        bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
+        L = cameraRay->weight *5* Li_ori(cameraRay->ray, lambda, sampler, scratchBuffer,
+                                   initializeVisibleSurface ? &visibleSurface : nullptr);
+
+        // Issue warning if unexpected radiance value is returned
+        if (L.HasNaNs()) {
+            LOG_ERROR("Not-a-number radiance value returned for pixel (%d, "
+                      "%d), sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        } else if (IsInf(L.y(lambda))) {
+            LOG_ERROR("Infinite radiance value returned for pixel (%d, %d), "
+                      "sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        }
+
+        PBRT_DBG(
+            "%s\n",
+            StringPrintf("Camera sample: %s -> ray %s -> L = %s, visibleSurface %s",
+                         cameraSample, cameraRay->ray, L,
+                         (visibleSurface ? visibleSurface.ToString() : "(none)"))
+                .c_str());
+        
+        camera.GetFilm().AddSample(pPixel, L, lambda, &visibleSurface,
+                               cameraSample.filterWeight);
+    
+        if(L.MinComponentValue()<-0.5f||L.MaxComponentValue()>0.5f)
+            LOG_VERBOSE("Pixel:%s Value:%s SampleIdx:%d",pPixel,L,sampleIndex);
+
+        // Sample deltas
+        for(int i=1;i<=4;++i){
+            L = cameraRay->weight*5* 0.25f * Li_delta(cameraRay->ray, lambda, sampler, scratchBuffer,
+                                    initializeVisibleSurface ? &visibleSurface : nullptr);
+
+            // Issue warning if unexpected radiance value is returned
+            if (L.HasNaNs()) {
+                LOG_ERROR("Not-a-number radiance value returned for pixel (%d, "
+                        "%d), sample %d. Setting to black.",
+                        pPixel.x, pPixel.y, sampleIndex);
+                L = SampledSpectrum(0.f);
+            } else if (IsInf(L.y(lambda))) {
+                LOG_ERROR("Infinite radiance value returned for pixel (%d, %d), "
+                        "sample %d. Setting to black.",
+                        pPixel.x, pPixel.y, sampleIndex);
+                L = SampledSpectrum(0.f);
+            }
+
+            PBRT_DBG(
+                "%s\n",
+                StringPrintf("Camera sample: %s -> ray %s -> L = %s, visibleSurface %s",
+                            cameraSample, cameraRay->ray, L,
+                            (visibleSurface ? visibleSurface.ToString() : "(none)"))
+                    .c_str());
+            
+            camera.GetFilm().AddSample(pPixel, L, lambda, &visibleSurface,
+                                cameraSample.filterWeight);
+        
+            if(L.MinComponentValue()<-0.5f||L.MaxComponentValue()>0.5f)
+                LOG_VERBOSE("Pixel:%s Value:%s SampleIdx:%d",pPixel,L,sampleIndex);
+        }
+        
+    } else {
+	    PBRT_DBG("%s\n",
+	             StringPrintf("Camera sample: %s -> no ray generated", cameraSample)
+			             .c_str());
+        camera.GetFilm().AddSample(pPixel, SampledSpectrum(0.f), lambda, &visibleSurface,
+                               cameraSample.filterWeight);
+    }
+    // Add camera ray's contribution to image
+    // camera.GetFilm().AddSample(pPixel, L, lambda, &visibleSurface,
+    //                            cameraSample.filterWeight);
+    
+    // if(L.MinComponentValue()<-0.5f||L.MaxComponentValue()>0.5f)
+    //     LOG_VERBOSE("Pixel:%s Value:%s SampleIdx:%d",pPixel,L,sampleIndex);
+}
+*/
+
+// MODIFIED: Render an initial image with spp=1024 first then render the rest using the deltas
+// function Li() is bypassed in this way
+void SimpleVolPathDeltaIntegrator::Render() {
+    // Handle debugStart, if set
+    if (!Options->debugStart.empty()) {
+        std::vector<int> c = SplitStringToInts(Options->debugStart, ',');
+        if (c.empty())
+            ErrorExit("Didn't find integer values after --debugstart: %s",
+                      Options->debugStart);
+        if (c.size() != 3)
+            ErrorExit("Didn't find three integer values after --debugstart: %s",
+                      Options->debugStart);
+
+        Point2i pPixel(c[0], c[1]);
+        int sampleIndex = c[2];
+        int spp = samplerPrototype.SamplesPerPixel();
+
+        ScratchBuffer scratchBuffer(65536);
+        Sampler tileSampler = samplerPrototype.Clone(Allocator());
+        tileSampler.StartPixelSample(pPixel, sampleIndex);
+
+        if(sampleIndex<1024) EvaluatePixelSample_ori(pPixel, sampleIndex, tileSampler, scratchBuffer);
+        else EvaluatePixelSample_delta(pPixel, sampleIndex, tileSampler, scratchBuffer, spp);
+
+        return;
+    }
+
+    thread_local Point2i threadPixel;
+    thread_local int threadSampleIndex;
+    CheckCallbackScope _([&]() {
+        return StringPrintf("Rendering failed at pixel (%d, %d) sample %d. Debug with "
+                            "\"--debugstart %d,%d,%d\"\n",
+                            threadPixel.x, threadPixel.y, threadSampleIndex,
+                            threadPixel.x, threadPixel.y, threadSampleIndex);
+    });
+
+    // Declare common variables for rendering image in tiles
+    ThreadLocal<ScratchBuffer> scratchBuffers([]() { return ScratchBuffer(); });
+
+    ThreadLocal<Sampler> samplers([this]() { return samplerPrototype.Clone(); });
+
+    Bounds2i pixelBounds = camera.GetFilm().PixelBounds();
+    int spp = samplerPrototype.SamplesPerPixel();
+    ProgressReporter progress(int64_t(spp) * pixelBounds.Area(), "Rendering",
+                              Options->quiet);
+
+    int waveStart = 0, waveEnd = 1, nextWaveSize = 1;
+
+    if (Options->recordPixelStatistics)
+        StatsEnablePixelStats(pixelBounds,
+                              RemoveExtension(camera.GetFilm().GetFilename()));
+    // Handle MSE reference image, if provided
+    pstd::optional<Image> referenceImage;
+    FILE *mseOutFile = nullptr;
+    if (!Options->mseReferenceImage.empty()) {
+        auto mse = Image::Read(Options->mseReferenceImage);
+        referenceImage = mse.image;
+
+        Bounds2i msePixelBounds =
+            mse.metadata.pixelBounds
+                ? *mse.metadata.pixelBounds
+                : Bounds2i(Point2i(0, 0), referenceImage->Resolution());
+        if (!Inside(pixelBounds, msePixelBounds))
+            ErrorExit("Output image pixel bounds %s aren't inside the MSE "
+                      "image's pixel bounds %s.",
+                      pixelBounds, msePixelBounds);
+
+        // Transform the pixelBounds of the image we're rendering to the
+        // coordinate system with msePixelBounds.pMin at the origin, which
+        // in turn gives us the section of the MSE image to crop. (This is
+        // complicated by the fact that Image doesn't support pixel
+        // bounds...)
+        Bounds2i cropBounds(Point2i(pixelBounds.pMin - msePixelBounds.pMin),
+                            Point2i(pixelBounds.pMax - msePixelBounds.pMin));
+        *referenceImage = referenceImage->Crop(cropBounds);
+        CHECK_EQ(referenceImage->Resolution(), Point2i(pixelBounds.Diagonal()));
+
+        mseOutFile = FOpenWrite(Options->mseReferenceOutput);
+        if (!mseOutFile)
+            ErrorExit("%s: %s", Options->mseReferenceOutput, ErrorString());
+    }
+
+    // Connect to display server if needed
+    if (!Options->displayServer.empty()) {
+        Film film = camera.GetFilm();
+        DisplayDynamic(film.GetFilename(), Point2i(pixelBounds.Diagonal()),
+                       {"R", "G", "B"},
+                       [&](Bounds2i b, pstd::span<pstd::span<float>> displayValue) {
+                           int index = 0;
+                           for (Point2i p : b) {
+                               RGB rgb = film.GetPixelRGB(pixelBounds.pMin + p,
+                                                          2.f / (waveStart + waveEnd));
+                               for (int c = 0; c < 3; ++c)
+                                   displayValue[c][index] = rgb[c];
+                               ++index;
+                           }
+                       });
+    }
+
+    // Render image in waves
+    while (waveStart < spp) {
+        // Render current wave's image tiles in parallel
+        ParallelFor2D(pixelBounds, [&](Bounds2i tileBounds) {
+            // Render image tile given by _tileBounds_
+            ScratchBuffer &scratchBuffer = scratchBuffers.Get();
+            Sampler &sampler = samplers.Get();
+            PBRT_DBG("Starting image tile (%d,%d)-(%d,%d) waveStart %d, waveEnd %d\n",
+                     tileBounds.pMin.x, tileBounds.pMin.y, tileBounds.pMax.x,
+                     tileBounds.pMax.y, waveStart, waveEnd);
+            for (Point2i pPixel : tileBounds) {
+                StatsReportPixelStart(pPixel);
+                threadPixel = pPixel;
+                // Render samples in pixel _pPixel_
+                for (int sampleIndex = waveStart; sampleIndex < waveEnd; ++sampleIndex) {
+                    threadSampleIndex = sampleIndex;
+                    sampler.StartPixelSample(pPixel, sampleIndex);
+                    if(sampleIndex<1024) EvaluatePixelSample_ori(pPixel, sampleIndex, sampler, scratchBuffer);
+                    else EvaluatePixelSample_delta(pPixel, sampleIndex, sampler, scratchBuffer, spp);
+                    scratchBuffer.Reset();
+                }
+
+                StatsReportPixelEnd(pPixel);
+            }
+            PBRT_DBG("Finished image tile (%d,%d)-(%d,%d)\n", tileBounds.pMin.x,
+                     tileBounds.pMin.y, tileBounds.pMax.x, tileBounds.pMax.y);
+            progress.Update((waveEnd - waveStart) * tileBounds.Area());
+        });
+
+        // Update start and end wave
+        waveStart = waveEnd;
+        waveEnd = std::min(spp, waveEnd + nextWaveSize);
+        if (!referenceImage)
+            nextWaveSize = std::min(2 * nextWaveSize, 64);
+        if (waveStart == spp)
+            progress.Done();
+
+        // Optionally write current image to disk
+        if (waveStart == spp || Options->writePartialImages || referenceImage) {
+            LOG_VERBOSE("Writing image with spp = %d", waveStart);
+            ImageMetadata metadata;
+            metadata.renderTimeSeconds = progress.ElapsedSeconds();
+            metadata.samplesPerPixel = waveStart;
+            if (referenceImage) {
+                ImageMetadata filmMetadata;
+                Image filmImage =
+                    camera.GetFilm().GetImage(&filmMetadata, 1.f / waveStart);
+                ImageChannelValues mse =
+                    filmImage.MSE(filmImage.AllChannelsDesc(), *referenceImage);
+                fprintf(mseOutFile, "%d, %.9g\n", waveStart, mse.Average());
+                metadata.MSE = mse.Average();
+                fflush(mseOutFile);
+            }
+            if (waveStart == spp || Options->writePartialImages) {
+                camera.InitMetadata(&metadata);
+                camera.GetFilm().WriteImage(metadata, 1.0f / waveStart);
+            }
+        }
+    }
+
+    if (mseOutFile)
+        fclose(mseOutFile);
+    DisconnectFromDisplayServer();
+    LOG_VERBOSE("Rendering finished");
+}
+
+void SimpleVolPathDeltaIntegrator::EvaluatePixelSample_ori(Point2i pPixel, int sampleIndex, Sampler sampler,
+                                            ScratchBuffer &scratchBuffer) {
+    // Sample wavelengths for the ray
+    Float lu = sampler.Get1D();
+    if (Options->disableWavelengthJitter)
+        lu = 0.5;
+    SampledWavelengths lambda = camera.GetFilm().SampleWavelengths(lu);
+
+    // Initialize _CameraSample_ for current sample
+    Filter filter = camera.GetFilm().GetFilter();
+    CameraSample cameraSample = GetCameraSample(sampler, pPixel, filter);
+
+    // Generate camera ray for current sample
+    pstd::optional<CameraRayDifferential> cameraRay =
+        camera.GenerateRayDifferential(cameraSample, lambda);
+
+    // Trace _cameraRay_ if valid
+    SampledSpectrum L(0.);
+    VisibleSurface visibleSurface;
+    if (cameraRay) {
+        // Double check that the ray's direction is normalized.
+        DCHECK_GT(Length(cameraRay->ray.d), .999f);
+        DCHECK_LT(Length(cameraRay->ray.d), 1.001f);
+        // Scale camera ray differentials based on image sampling rate
+        Float rayDiffScale =
+            std::max<Float>(.125f, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+        if (!Options->disablePixelJitter)
+            cameraRay->ray.ScaleDifferentials(rayDiffScale);
+
+        ++nCameraRays;
+        // Evaluate radiance along camera ray
+        bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
+        L = cameraRay->weight * Li_ori(cameraRay->ray, lambda, sampler, scratchBuffer,
+                                   initializeVisibleSurface ? &visibleSurface : nullptr);
+
+        // Issue warning if unexpected radiance value is returned
+        if (L.HasNaNs()) {
+            LOG_ERROR("Not-a-number radiance value returned for pixel (%d, "
+                      "%d), sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        } else if (IsInf(L.y(lambda))) {
+            LOG_ERROR("Infinite radiance value returned for pixel (%d, %d), "
+                      "sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        }
+
+        PBRT_DBG(
+            "%s\n",
+            StringPrintf("Camera sample: %s -> ray %s -> L = %s, visibleSurface %s",
+                         cameraSample, cameraRay->ray, L,
+                         (visibleSurface ? visibleSurface.ToString() : "(none)"))
+                .c_str());
+    } else {
+	    PBRT_DBG("%s\n",
+	             StringPrintf("Camera sample: %s -> no ray generated", cameraSample)
+			             .c_str());
+    }
+    // Add camera ray's contribution to image
+    camera.GetFilm().AddSample(pPixel, L, lambda, &visibleSurface,
+                               cameraSample.filterWeight);
+    // if(L.MinComponentValue()<-0.5f||L.MaxComponentValue()>0.5f)
+    //     LOG_VERBOSE("Pixel:%s Value:%s SampleIdx:%d",pPixel,L,sampleIndex);
+}
+
+void SimpleVolPathDeltaIntegrator::EvaluatePixelSample_delta(Point2i pPixel, int sampleIndex, Sampler sampler,
+                                        ScratchBuffer &scratchBuffer, int spp) {
+    // Sample wavelengths for the ray
+    Float lu = sampler.Get1D();
+    if (Options->disableWavelengthJitter)
+        lu = 0.5;
+    SampledWavelengths lambda = camera.GetFilm().SampleWavelengths(lu);
+
+    // Initialize _CameraSample_ for current sample
+    Filter filter = camera.GetFilm().GetFilter();
+    CameraSample cameraSample = GetCameraSample(sampler, pPixel, filter);
+
+    // Generate camera ray for current sample
+    pstd::optional<CameraRayDifferential> cameraRay =
+        camera.GenerateRayDifferential(cameraSample, lambda);
+
+    // Trace _cameraRay_ if valid
+    SampledSpectrum L(0.);
+    VisibleSurface visibleSurface;
+    if (cameraRay) {
+        // Double check that the ray's direction is normalized.
+        DCHECK_GT(Length(cameraRay->ray.d), .999f);
+        DCHECK_LT(Length(cameraRay->ray.d), 1.001f);
+        // Scale camera ray differentials based on image sampling rate
+        Float rayDiffScale =
+            std::max<Float>(.125f, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+        if (!Options->disablePixelJitter)
+            cameraRay->ray.ScaleDifferentials(rayDiffScale);
+
+        ++nCameraRays;
+        // Evaluate radiance along camera ray
+        bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
+        L = cameraRay->weight *1024.0/(spp-1024)* Li_delta_dtrk_exp(cameraRay->ray, lambda, sampler, scratchBuffer,
+                                   initializeVisibleSurface ? &visibleSurface : nullptr);
+
+        // Issue warning if unexpected radiance value is returned
+        if (L.HasNaNs()) {
+            LOG_ERROR("Not-a-number radiance value returned for pixel (%d, "
+                      "%d), sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        } else if (IsInf(L.y(lambda))) {
+            LOG_ERROR("Infinite radiance value returned for pixel (%d, %d), "
+                      "sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        }
+
+        PBRT_DBG(
+            "%s\n",
+            StringPrintf("Camera sample: %s -> ray %s -> L = %s, visibleSurface %s",
+                         cameraSample, cameraRay->ray, L,
+                         (visibleSurface ? visibleSurface.ToString() : "(none)"))
+                .c_str());
+    } else {
+	    PBRT_DBG("%s\n",
+	             StringPrintf("Camera sample: %s -> no ray generated", cameraSample)
+			             .c_str());
+    }
+    // Add camera ray's contribution to image
+    camera.GetFilm().Cast<RGBFilm>()->AddSample_noweight(pPixel, L, lambda, &visibleSurface,
+                                                         cameraSample.filterWeight);
+    if(L.MinComponentValue()<-0.5f||L.MaxComponentValue()>0.5f)
+        LOG_VERBOSE("Pixel:%s Value:%s SampleIdx:%d",pPixel,L,sampleIndex);
+}
+
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li(RayDifferential ray,
+                                                 SampledWavelengths &lambda, Sampler sampler,
+                                                 ScratchBuffer &buf, VisibleSurface *) const {
+    SampledSpectrum L=Li_ori(ray,lambda,sampler,buf,nullptr);
+    for(int i=1;i<=32;++i) L+=1.0/32.0*Li_delta(ray,lambda,sampler,buf,nullptr);
+    return L;
+}
+
+// Main function: still developing
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        bool scattered = false, terminated = false, jumped = false;
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 2.0/10, 2.0/10}, three_modes_u);
+            //beta *= 3; //RR weight
+
+            Float Tr_old = 1.0f, Tr_new = 1.0f;// for three_modes == 2
+            Float total_weight=0.0f;// for three_modes == 1
+            Point3f prev_point=ray.o;
+            Float Tr_cur=1.0f;
+            Point3f sampled_point;
+
+            if(three_modes == 0 ){
+                beta *= 5.0/3;
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp=vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+            }else if(three_modes == 2){
+                // sample according to sigma_old * Tr_old
+                beta *= 5.0;
+                Float tMax = si ? si->tHit : Infinity; 
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_old(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp=vmp[0];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    Tr_old *= pNull;
+                                    Tr_new *= std::max<Float>(0, 1.0-(vmp[1].sigma_a[0]+vmp[1].sigma_s[0])/sigma_maj[0]);
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    // beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+                                    // Critical here! delta_Tr/Tr
+                                    beta *= (Tr_new-Tr_old)/Tr_old;
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+            }else{
+                beta *= 5.0;
+                Float tMax = si ? si->tHit : Infinity; 
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                bool initialized = false;
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj){
+                                MediumProperties mp=vmp[1];
+                                Float d=Distance(p,prev_point);
+                                total_weight+=d*Tr_cur;
+                                
+                                if(!initialized){
+                                    //first time: sample a point on the segment
+                                    initialized=true;
+                                    sampled_point=prev_point+Normalize(ray.d)*d*uMode;
+                                }else{
+                                    if(rng.Uniform<Float>() < d*Tr_cur/total_weight){
+                                        //resample a point
+                                        sampled_point=prev_point+Normalize(ray.d)*d*rng.Uniform<Float>();
+                                    }
+                                }
+                                prev_point=p;
+                                Tr_cur *= std::max<Float>(0, 1.0-(mp.sigma_a[0]+mp.sigma_s[0])/sigma_maj[0]);
+                                return true;
+                            });
+                //Compute the final segment
+                CHECK(si); // the medium should not reach infinity...OR COULD THEY?
+                Float d=si->tHit*Length(ray.d)-Distance(ray.o,prev_point);
+                total_weight+=d*Tr_cur;
+                if(!initialized){
+                    //first time: sample a point on the segment
+                    initialized=true;
+                    sampled_point=prev_point+Normalize(ray.d)*d*uMode;
+                }else{
+                    if(rng.Uniform<Float>() < d*Tr_cur/total_weight){
+                        //resample a point
+                        sampled_point=prev_point+Normalize(ray.d)*d*rng.Uniform<Float>();
+                    }
+                }
+                // Ended reservoir sampling and update beta
+                pstd::array<MediumProperties,2> vmp=ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(sampled_point,lambda);
+                Float delta_sigma=vmp[1].sigma_a[0]+vmp[1].sigma_s[0]-vmp[0].sigma_a[0]-vmp[0].sigma_s[0];
+                //beta *= delta_sigma * total_weight * (vmp.y.sigma_s[0]/(vmp.y.sigma_a[0]+vmp.y.sigma_s[0]));
+                beta *= delta_sigma * total_weight * ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+
+                // Sample New Ray!
+                Point2f u_point{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                pstd::optional<PhaseFunctionSample> ps =
+                    vmp[1].phase.Sample_p(-ray.d, u_point);
+                if (!ps) {
+                    return delta_L;
+                }
+                beta *= ps->p / ps->pdf;
+                ray.o = sampled_point;
+                ray.d = ps->wi;
+                return beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+
+            }
+
+            // Handle terminated and unscattered rays after medium sampling
+            if (terminated) // terminated due to RR or unable to sample a direction
+                return delta_L;
+            if (scattered){
+                if(three_modes == 0)
+                    continue;
+                else if(three_modes == 2)
+                    return beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+            }
+
+            // boundary conditions 
+            if(three_modes == 0){
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            }else if(three_modes == 2){
+                //calculate incoming radiance then delta_Tr/Tr
+                beta *= (Tr_new-Tr_old)/Tr_old;
+                SampledSpectrum Le(0.0f);
+                // Add emission to surviving ray
+                if (si)
+                    Le += si->intr.Le(-ray.d, lambda);
+                else {
+                    for (const auto &light : infiniteLights)
+                        Le += light.Le(ray, lambda);
+                    return Le * beta;
+                }
+                // Handle surface intersection along ray path
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf){
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                    return beta*(Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth));
+                } else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return Le*beta;
+                }
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+// new formula but results in large variance
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_new(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        bool scattered = false, terminated = false, jumped = false;
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 2.0/10, 2.0/10}, three_modes_u);
+            if(three_modes==0) beta *= 5.0/3;
+            else if(three_modes==1) beta *= 5.0;
+            else beta *= 5.0;
+
+            // sample according to sigma_new * Tr_new
+            Float tMax = si ? si->tHit : Infinity; 
+            Float u = sampler.Get1D(); // deciding distance
+            Float uMode = sampler.Get1D(); // deciding mode
+            SampleT_maj_new(ray, tMax, u, rng, lambda,
+                            [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                            SampledSpectrum T_maj) {
+                            MediumProperties mp = (three_modes == 2) ? vmp[0] : vmp[1];
+                            // Compute medium event probabilities for interaction
+                            Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                            Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                            Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                            // Randomly sample medium scattering event for delta tracking
+                            int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                            if (mode == 0) {
+                                // Handle null-scattering event for medium sample
+                                uMode = rng.Uniform<Float>();
+                                return true;
+
+                            } else {
+                                // Handle regular scattering event for medium sample
+                                //beta *= pScatter / (pAbsorb + pScatter);
+                                beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                // Stop path sampling if maximum depth has been reached
+                                if (depth++ >= 3) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Sample phase function for medium scattering event
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =
+                                    mp.phase.Sample_p(-ray.d, u);
+                                if (!ps) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Update state for recursive evaluation of $L_\roman{i}$
+                                beta *= ps->p / ps->pdf;
+                                ray.o = p;
+                                ray.d = ps->wi;
+                                scattered = true;
+                                return false;
+
+                            }
+                        });
+
+
+            // Handle terminated and unscattered rays after medium sampling
+            if (terminated) // terminated due to RR or unable to sample a direction
+                return delta_L;
+            if (scattered){
+                if(three_modes == 0)
+                    continue;
+                else if(three_modes == 1)
+                    return beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+                else 
+                    return -beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+            }
+
+            // boundary conditions 
+            if(three_modes == 0){
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            }else{
+                SampledSpectrum Le(0.0f);
+                // Add emission to surviving ray
+                if (si)
+                    Le += si->intr.Le(-ray.d, lambda);
+                else {
+                    for (const auto &light : infiniteLights)
+                        Le += light.Le(ray, lambda);
+                    return Le * beta * ((three_modes == 2) ? -1. : 1.);
+                }
+                // Handle surface intersection along ray path
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf){
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                    return beta * (Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth)) * ((three_modes == 2) ? -1. : 1.);
+                } else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return Le * beta * ((three_modes == 2) ? -1. : 1.);
+                }
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+// new formula but averaged 
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_large(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 4.0/10}, three_modes_u);
+
+            if(three_modes == 0){
+                beta *= 5.0/3;
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction
+                    return SampledSpectrum(0.0f);
+                if (scattered)
+                    continue;
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            } else {
+                beta *= 2.5;
+                RayDifferential ori_ray(ray);
+                Float ori_beta = beta;
+                int ori_depth = depth;
+                for(int i=1;i<=512;++i){
+                    // second term
+                    bool scattered = false, terminated = false;
+                    ray = ori_ray;
+                    beta = ori_beta;
+                    depth = ori_depth;
+                    // sample according to sigma_new * Tr_new
+                    Float tMax = si ? si->tHit : Infinity; 
+                    Float u = sampler.Get1D(); // deciding distance
+                    Float uMode = sampler.Get1D(); // deciding mode
+                    SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                    [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                    SampledSpectrum T_maj) {
+                                    MediumProperties mp = vmp[1];
+                                    // Compute medium event probabilities for interaction
+                                    Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                    Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                    Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                    // Randomly sample medium scattering event for delta tracking
+                                    int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                    if (mode == 0) {
+                                        // Handle null-scattering event for medium sample
+                                        uMode = rng.Uniform<Float>();
+                                        return true;
+
+                                    } else {
+                                        // Handle regular scattering event for medium sample
+                                        //beta *= pScatter / (pAbsorb + pScatter);
+                                        beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                        // Stop path sampling if maximum depth has been reached
+                                        if (depth++ >= maxDepth) {
+                                            terminated = true;
+                                            return false;
+                                        }
+
+                                        // Sample phase function for medium scattering event
+                                        Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                        pstd::optional<PhaseFunctionSample> ps =
+                                            mp.phase.Sample_p(-ray.d, u);
+                                        if (!ps) {
+                                            terminated = true;
+                                            return false;
+                                        }
+
+                                        // Update state for recursive evaluation of $L_\roman{i}$
+                                        beta *= ps->p / ps->pdf;
+                                        ray.o = p;
+                                        ray.d = ps->wi;
+                                        scattered = true;
+                                        return false;
+
+                                    }
+                                });
+                    if (terminated){ // terminated due to RR or unable to sample a direction
+                        delta_L += SampledSpectrum(0.0f)/512;
+                        continue;
+                    }
+                    if (scattered){
+                        delta_L += beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth)/512;
+                        continue;
+                    }
+                    SampledSpectrum Le(0.0f);
+                    // Add emission to surviving ray
+                    if (si)
+                        Le += si->intr.Le(-ray.d, lambda);
+                    else {
+                        for (const auto &light : infiniteLights)
+                            Le += light.Le(ray, lambda);
+                        delta_L += Le * beta / 512;
+                        continue;
+                    }
+                    // Handle surface intersection along ray path
+                    BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                    if (!bsdf){
+                        si->intr.SkipIntersection(&ray, si->tHit);
+                        delta_L += beta * (Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth)) / 512;
+                        continue;
+                    } else {
+                        // Report error if BSDF returns a valid sample
+                        Float uc = sampler.Get1D();
+                        Point2f u = sampler.Get2D();
+                        if (bsdf.Sample_f(-ray.d, uc, u))
+                            ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                        else{
+                            delta_L += Le * beta / 512;
+                            continue;
+                        }    
+                    }
+                }
+                for(int i=1;i<=512;++i){
+                    // second term
+                    bool scattered = false, terminated = false;
+                    ray = ori_ray;
+                    beta = ori_beta;
+                    depth = ori_depth;                    
+                    // sample according to sigma_new * Tr_new
+                    Float tMax = si ? si->tHit : Infinity; 
+                    Float u = sampler.Get1D(); // deciding distance
+                    Float uMode = sampler.Get1D(); // deciding mode
+                    SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                    [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                    SampledSpectrum T_maj) {
+                                    MediumProperties mp = vmp[0];
+                                    // Compute medium event probabilities for interaction
+                                    Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                    Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                    Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                    // Randomly sample medium scattering event for delta tracking
+                                    int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                    if (mode == 0) {
+                                        // Handle null-scattering event for medium sample
+                                        uMode = rng.Uniform<Float>();
+                                        return true;
+
+                                    } else {
+                                        // Handle regular scattering event for medium sample
+                                        //beta *= pScatter / (pAbsorb + pScatter);
+                                        beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                        // Stop path sampling if maximum depth has been reached
+                                        if (depth++ >= maxDepth) {
+                                            terminated = true;
+                                            return false;
+                                        }
+
+                                        // Sample phase function for medium scattering event
+                                        Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                        pstd::optional<PhaseFunctionSample> ps =
+                                            mp.phase.Sample_p(-ray.d, u);
+                                        if (!ps) {
+                                            terminated = true;
+                                            return false;
+                                        }
+
+                                        // Update state for recursive evaluation of $L_\roman{i}$
+                                        beta *= ps->p / ps->pdf;
+                                        ray.o = p;
+                                        ray.d = ps->wi;
+                                        scattered = true;
+                                        return false;
+
+                                    }
+                                });
+                    if (terminated){ // terminated due to RR or unable to sample a direction
+                        delta_L -= SampledSpectrum(0.0f)/512;
+                        continue;
+                    }
+                    if (scattered){
+                        delta_L -= beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth)/512;
+                        continue;
+                    }
+                    SampledSpectrum Le(0.0f);
+                    // Add emission to surviving ray
+                    if (si)
+                        Le += si->intr.Le(-ray.d, lambda);
+                    else {
+                        for (const auto &light : infiniteLights)
+                            Le += light.Le(ray, lambda);
+                        delta_L -= Le * beta / 512;
+                        continue;
+                    }
+                    // Handle surface intersection along ray path
+                    BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                    if (!bsdf){
+                        si->intr.SkipIntersection(&ray, si->tHit);
+                        delta_L -= beta * (Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth)) / 512;
+                        continue;
+                    } else {
+                        // Report error if BSDF returns a valid sample
+                        Float uc = sampler.Get1D();
+                        Point2f u = sampler.Get2D();
+                        if (bsdf.Sample_f(-ray.d, uc, u))
+                            ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                        else{
+                            delta_L -= Le * beta / 512;
+                            continue;
+                        }    
+                    }
+                }
+                // return here
+                return delta_L;
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+// hereafter all these urms are buggy!
+ 
+// using ray marching (biased) for Tr estimate
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_biased(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 4.0/10}, three_modes_u);
+
+            if(three_modes == 0){
+                beta *= 5.0/3;
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction
+                    return SampledSpectrum(0.0f);
+                if (scattered)
+                    continue;
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            } else {
+                beta *= 2.5;
+                Float beta_ori = beta;
+                Float sample_prob, sigmaAtT;
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // used in unbiased estimate of optical depth
+                // reserved for ray marching
+                Point3f p_scatter;
+                pstd::optional<PhaseFunctionSample> pss;
+                pstd::array<MediumProperties,2> vmpp;
+                SampledSpectrum Tr_maj = SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                vmpp = vmp; //reserved for ray marching
+                                p_scatter = p; //reserved for ray marching
+                                sample_prob = T_maj[0] * sigma_maj[0];
+                                sigmaAtT = sigma_maj[0];
+                                beta /= sample_prob; //inverse pdf
+                                beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+
+                                // Stop path sampling if maximum depth has been reached
+                                if (depth++ >= maxDepth) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Sample phase function for forward lighting
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =
+                                    mp.phase.Sample_p(-ray.d, u);
+                                if (!ps) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                beta *= ps->p / ps->pdf;
+                                pss = ps;
+
+                                // postpone their update
+                                //ray.o = p;
+                                //ray.d = ps->wi;
+
+                                scattered = true;
+                                return false;
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction: no forward branch in this case
+                    return SampledSpectrum(0.0f);
+                if (scattered){
+                    // estimate pre and post transmittance using ray marching
+                    Float dis = Distance(ray.o, p_scatter);
+                    Float tau_old = 0., tau_new = 0.;
+                    for(int i=0;i<50;++i){
+                        Float lambda_ray = 0.02 * (i + uMode);
+                        pstd::array<MediumProperties,2> vmp = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(lambda_ray*ray.o+(1.f-lambda_ray)*p_scatter,lambda);
+                        tau_old += vmp[0].sigma_a[0]+vmp[0].sigma_s[0];
+                        tau_new += vmp[1].sigma_a[0]+vmp[1].sigma_s[0];
+                    }
+                    tau_old *= 0.02*dis;
+                    tau_new *= 0.02*dis;
+                    Float Tr_old = FastExp(-tau_old);
+                    Float Tr_new = FastExp(-tau_new);
+                    Float dtds = Tr_new * (vmpp[1].sigma_a[0]+vmpp[1].sigma_s[0]) - Tr_old * (vmpp[0].sigma_a[0]+vmpp[0].sigma_s[0]);
+                    beta *= dtds;
+                    if(beta/beta_ori > 3.0f)
+                        LOG_VERBOSE("Danger: beta in medium too large(%f): sample_prob %f dtds %f Tr_old %f Tr_new %f sigma_old %f sigma_new %f sigma_maj %f",
+                        beta/beta_ori,sample_prob,dtds,Tr_old,Tr_new,(vmpp[0].sigma_a[0]+vmpp[0].sigma_s[0]),(vmpp[1].sigma_a[0]+vmpp[1].sigma_s[0]),sigmaAtT);
+
+                    //forward lighting
+                    ray.o = p_scatter;
+                    ray.d = pss->wi;
+                    return beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+                }
+
+
+                // boundary conditions
+                sample_prob = Tr_maj[0];
+                beta /= Tr_maj[0]; // sampling prob.
+                p_scatter = ray.o + tMax * ray.d;
+
+                // estimate pre and post transmittance using ray marching
+                Float dis = Distance(ray.o, p_scatter);
+                Float tau_old = 0., tau_new = 0.;
+                for(int i=0;i<50;++i){
+                    Float lambda_ray = 0.02 * (i + uMode);
+                    pstd::array<MediumProperties,2> vmp = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(lambda_ray*ray.o+(1.f-lambda_ray)*p_scatter,lambda);
+                    tau_old += vmp[0].sigma_a[0]+vmp[0].sigma_s[0];
+                    tau_new += vmp[1].sigma_a[0]+vmp[1].sigma_s[0];
+                }
+                tau_old *= 0.02*dis;
+                tau_new *= 0.02*dis;
+                Float Tr_old = FastExp(-tau_old);
+                Float Tr_new = FastExp(-tau_new);
+                beta *= Tr_new - Tr_old;
+                if(beta/beta_ori > 3.0f)
+                    LOG_VERBOSE("Danger: beta at surface too large(%f): sample_prob %f dt %f Tr_old %f Tr_new %f",
+                    beta/beta_ori,sample_prob,Tr_new-Tr_old,Tr_old,Tr_new);
+
+                // account for forward lighting
+                SampledSpectrum Le(0.0f);
+                // Add emission to surviving ray
+                if (si)
+                    Le += si->intr.Le(-ray.d, lambda);
+                else {
+                    for (const auto &light : infiniteLights)
+                        Le += light.Le(ray, lambda);
+                    return Le * beta;
+                }
+                // Handle surface intersection along ray path
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf){
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                    return beta*(Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth));
+                } else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return Le*beta;
+                }
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+// using ray marching (unbiased) for Tr estimate
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_urm(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 4.0/10}, three_modes_u);
+
+            if(three_modes == 0){
+                beta *= 5.0/3;
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction
+                    return SampledSpectrum(0.0f);
+                if (scattered)
+                    continue;
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            } else {
+                beta *= 2.5;
+                Float beta_ori = beta;
+                Float sample_prob, sigmaAtT;
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // used in unbiased estimate of optical depth
+                // reserved for ray marching
+                Point3f p_scatter;
+                pstd::optional<PhaseFunctionSample> pss;
+                pstd::array<MediumProperties,2> vmpp;
+                Float ODepth_maj = 0.;
+                SampledSpectrum Tr_maj = SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                vmpp = vmp; //reserved for ray marching
+                                p_scatter = p; //reserved for ray marching
+                                ODepth_maj = -std::log(T_maj[0]);
+                                sample_prob = T_maj[0] * sigma_maj[0];
+                                sigmaAtT = sigma_maj[0];
+                                beta /= sample_prob; //inverse pdf
+                                beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+
+                                // Stop path sampling if maximum depth has been reached
+                                if (depth++ >= maxDepth) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Sample phase function for forward lighting
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =
+                                    mp.phase.Sample_p(-ray.d, u);
+                                if (!ps) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                beta *= ps->p / ps->pdf;
+                                pss = ps;
+
+                                // postpone their update
+                                //ray.o = p;
+                                //ray.d = ps->wi;
+
+                                scattered = true;
+                                return false;
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction: no forward branch in this case
+                    return SampledSpectrum(0.0f);
+                if (scattered){
+                    // estimate pre and post transmittance using ray marching
+                    Float dis = Distance(ray.o, p_scatter);
+                    Float tMax_urm = dis / Length(ray.d);
+                    Float Tr_old, Tr_new;
+                    // for(int i=0;i<50;++i){
+                    //     Float lambda_ray = 0.02 * (i + uMode);
+                    //     pstd::array<MediumProperties,2> vmp = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(lambda_ray*ray.o+(1.f-lambda_ray)*p_scatter,lambda);
+                    //     tau_old += vmp[0].sigma_a[0]+vmp[0].sigma_s[0];
+                    //     tau_new += vmp[1].sigma_a[0]+vmp[1].sigma_s[0];
+                    // }
+                    // tau_old *= 0.02*dis;
+                    // tau_new *= 0.02*dis;
+                    // Float Tr_old = FastExp(-tau_old);
+                    // Float Tr_new = FastExp(-tau_new);
+                    Tr_urm(ray,tMax_urm,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                    Float dtds = Tr_new * (vmpp[1].sigma_a[0]+vmpp[1].sigma_s[0]) - Tr_old * (vmpp[0].sigma_a[0]+vmpp[0].sigma_s[0]);
+                    beta *= dtds;
+                    // if(beta/beta_ori > 3.0f)
+                    //     LOG_VERBOSE("Danger: beta in medium too large(%f): sample_prob %f dtds %f Tr_old %f Tr_new %f sigma_old %f sigma_new %f sigma_maj %f",
+                    //     beta/beta_ori,sample_prob,dtds,Tr_old,Tr_new,(vmpp[0].sigma_a[0]+vmpp[0].sigma_s[0]),(vmpp[1].sigma_a[0]+vmpp[1].sigma_s[0]),sigmaAtT);
+
+                    //forward lighting
+                    ray.o = p_scatter;
+                    ray.d = pss->wi;
+                    return beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+                }
+
+
+                // boundary conditions
+                sample_prob = Tr_maj[0];
+                beta /= Tr_maj[0]; // sampling prob.
+                ODepth_maj = -std::log(Tr_maj[0]);
+                p_scatter = ray.o + tMax * ray.d;
+
+                // estimate pre and post transmittance using ray marching
+                //Float dis = Distance(ray.o, p_scatter);
+                Float Tr_old, Tr_new;
+                // Float tau_old = 0., tau_new = 0.;
+                // for(int i=0;i<50;++i){
+                //     Float lambda_ray = 0.02 * (i + uMode);
+                //     pstd::array<MediumProperties,2> vmp = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(lambda_ray*ray.o+(1.f-lambda_ray)*p_scatter,lambda);
+                //     tau_old += vmp[0].sigma_a[0]+vmp[0].sigma_s[0];
+                //     tau_new += vmp[1].sigma_a[0]+vmp[1].sigma_s[0];
+                // }
+                // tau_old *= 0.02*dis;
+                // tau_new *= 0.02*dis;
+                // Float Tr_old = FastExp(-tau_old);
+                // Float Tr_new = FastExp(-tau_new);
+                Tr_urm(ray,tMax,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                beta *= Tr_new - Tr_old;
+                // if(beta/beta_ori > 3.0f)
+                //     LOG_VERBOSE("Danger: beta at surface too large(%f): sample_prob %f dt %f Tr_old %f Tr_new %f",
+                //     beta/beta_ori,sample_prob,Tr_new-Tr_old,Tr_old,Tr_new);
+
+                // account for forward lighting
+                SampledSpectrum Le(0.0f);
+                // Add emission to surviving ray
+                if (si)
+                    Le += si->intr.Le(-ray.d, lambda);
+                else {
+                    for (const auto &light : infiniteLights)
+                        Le += light.Le(ray, lambda);
+                    return Le * beta;
+                }
+                // Handle surface intersection along ray path
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf){
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                    return beta*(Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth));
+                } else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return Le*beta;
+                }
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+
+void SimpleVolPathDeltaIntegrator::Tr_urm(Ray ray, Float tMax, const SampledWavelengths &lambda, ScratchBuffer &scratchbuffer, RNG &rng, Float &Tr_old, Float &Tr_new, Float ODepth_maj) const{
+    // determine rank
+    Float u = rng.Uniform<Float>();
+    int N = 0;
+    if(u > 0.1f) N = 0;
+    else{
+        Float P = 0.1f;
+        N = 2;
+        while(N <= 8){
+            N++;
+            P *= 2./N;
+            if(u > P) break;
+        }
+        N--;
+    }
+    //DEBUG TEST HERE!
+    // N = 2;
+
+    // create N+1 estimators for optical depth
+    int M = 50;
+    auto estimators_old = scratchbuffer.Alloc<Float[]>(N+1);
+    auto estimators_new = scratchbuffer.Alloc<Float[]>(N+1);
+    pstd::array<MediumProperties,2> vmp_0 = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(ray.o,lambda);
+    pstd::array<MediumProperties,2> vmp_tmax = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(ray(tMax),lambda);
+    Float mu_0_old = vmp_0[0].sigma_a[0]+vmp_0[0].sigma_s[0];
+    Float mu_0_new = vmp_0[1].sigma_a[0]+vmp_0[1].sigma_s[0];
+    Float mu_tmax_old = vmp_tmax[0].sigma_a[0]+vmp_tmax[0].sigma_s[0];
+    Float mu_tmax_new = vmp_tmax[1].sigma_a[0]+vmp_tmax[1].sigma_s[0];
+    for(int i=0;i<N+1;++i){
+        u = rng.Uniform<Float>();
+        estimators_old[i] = 0.0f;
+        estimators_new[i] = 0.0f;
+        // Use uniform sampling and endpoint matching
+        // for(int j=0;j<M;++j){
+        //     pstd::array<MediumProperties,2> vmp = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(ray(tMax*(j+u)/M),lambda);
+        //     estimators_old[i] += vmp[0].sigma_a[0]+vmp[0].sigma_s[0];
+        //     estimators_new[i] += vmp[1].sigma_a[0]+vmp[1].sigma_s[0];
+        // }
+        // estimators_old[i] *= -tMax / M * Length(ray.d);
+        // estimators_old[i] -= tMax / M * Length(ray.d) * (0.5f - u) * (mu_tmax_old - mu_0_old);
+        // estimators_new[i] *= -tMax / M * Length(ray.d);
+        // estimators_new[i] -= tMax / M * Length(ray.d) * (0.5f - u) * (mu_tmax_new - mu_0_new);
+
+        // Use pdf porportional to sigma_maj / ODepth_maj
+        ray.medium.Cast<DeltaGridMedium>()->SampleODepth_both(ray,tMax,u,lambda,ODepth_maj,M,estimators_old[i],estimators_new[i]);
+        estimators_old[i] *= -1.;
+        estimators_new[i] *= -1.;
+    }
+    // Compute elementary means
+    Tr_old = 0.f, Tr_new = 0.f;
+    auto elem_means_old = scratchbuffer.Alloc<Float[]>(N+1);
+    auto elem_means_new = scratchbuffer.Alloc<Float[]>(N+1);
+    for(int i=0;i<N+1;++i){
+        //using the i-th estimator as pivot and average others
+        elem_means_old[0] = elem_means_new[0] = 1.;
+        for(int j=1;j<N+1;++j) elem_means_old[j] = elem_means_new[j] = 0.;
+        for(int j=1;j<N+1;++j){
+            Float x = (j<=i) ? (estimators_old[j-1]-estimators_old[i]) : (estimators_old[j]-estimators_old[i]);
+            Float y = (j<=i) ? (estimators_new[j-1]-estimators_new[i]) : (estimators_new[j]-estimators_new[i]);
+            for(int k=j;k>0;--k){
+                elem_means_old[k] += 1. * k * (elem_means_old[k-1]*x-elem_means_old[k]) / j;
+                elem_means_new[k] += 1. * k * (elem_means_new[k-1]*y-elem_means_new[k]) / j;
+            }
+        }
+        Float multiplier_old = FastExp(estimators_old[i])/(N+1);
+        Float multiplier_new = FastExp(estimators_new[i])/(N+1);
+        Float P = 1.f;
+        for(int j=0;j<N+1;++j){
+            if(j==0) P=1.;
+            else if(j==1) P=0.1;
+            else P*=2.;
+            Tr_old += multiplier_old * elem_means_old[j] / P;
+            Tr_new += multiplier_new * elem_means_new[j] / P;
+            if(IsNaN(Tr_old)||IsNaN(Tr_new))
+                LOG_VERBOSE("FATAL: NAN HERE in Tr: j %d elem_means_old %f elem_means_new %f P %f",j,elem_means_old[j],elem_means_new[j],P);
+        }
+    }
+  
+}
+
+
+// using ray marching (unbiased) for Tr estimate
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_ris(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 4.0/10}, three_modes_u);
+
+            if(three_modes == 0){
+                beta *= 5.0/3;
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction
+                    return SampledSpectrum(0.0f);
+                if (scattered)
+                    continue;
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            } else {
+                beta *= 2.5;
+                Float tMax = si ? si->tHit : Infinity; 
+                if (depth++ >= maxDepth)
+                    return SampledSpectrum(0.0f);
+                
+                // RIS the sigma*T difference term to get a better sample
+                
+                Reservoir_sigmaT* reservoir = buf.Alloc<Reservoir_sigmaT>();
+                for(int res_iter = 0; res_iter < 64; ++res_iter){
+                            Float sample_prob;
+                            bool scattered = false;
+                            Float u = sampler.Get1D(); // deciding distance
+                            Float uMode = sampler.Get1D(); // used in unbiased estimate of optical depth
+                            // reserved for ray marching
+                            Point3f p_scatter;
+                            pstd::array<MediumProperties,2> vmpp;
+                            Float ODepth_maj = 0.;
+                            SampledSpectrum Tr_maj = SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                            [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                            SampledSpectrum T_maj) {
+                                            MediumProperties mp = vmp[1];
+                                            vmpp = vmp; //reserved for ray marching
+                                            p_scatter = p; //reserved for ray marching
+                                            ODepth_maj = -std::log(T_maj[0]);
+                                            sample_prob = T_maj[0] * sigma_maj[0];
+                                            scattered = true;
+                                            return false;
+                                        });
+                            if (scattered){
+                                // estimate pre and post transmittance using ray marching
+                                Float dis = Distance(ray.o, p_scatter);
+                                Float tMax_urm = dis / Length(ray.d);
+                                Float Tr_old, Tr_new;
+                                Tr_urm(ray,tMax_urm,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                                Float dtds = Tr_new * (vmpp[1].sigma_a[0]+vmpp[1].sigma_s[0]) - Tr_old * (vmpp[0].sigma_a[0]+vmpp[0].sigma_s[0]);
+                                reservoir->addSample(1./64.*dtds/sample_prob,dtds,p_scatter,vmpp[1],1,sampler.Get1D());
+                                continue;
+                            }
+                            // boundary conditions
+                            sample_prob = Tr_maj[0];
+                            ODepth_maj = -std::log(Tr_maj[0]);
+                            p_scatter = ray.o + tMax * ray.d;
+                            // estimate pre and post transmittance using ray marching
+                            Float Tr_old, Tr_new;
+                            Tr_urm(ray,tMax,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                            reservoir->addSample(1./64.*(Tr_new-Tr_old)/sample_prob,Tr_new-Tr_old,p_scatter,vmpp[1],0,sampler.Get1D());
+                }
+                
+                if(reservoir->isInside){
+                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda)*reservoir->w_tot;
+                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                    pstd::optional<PhaseFunctionSample> ps =
+                        reservoir->mp.phase.Sample_p(-ray.d, u);
+                    if (!ps) {
+                        return SampledSpectrum(0.0f);
+                    }
+                    beta *= ps->p / ps->pdf;
+                    ray.o = reservoir->location;
+                    ray.d = ps->wi;
+                    return beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+                }
+                beta *= reservoir->w_tot;
+                // account for forward lighting
+                SampledSpectrum Le(0.0f);
+                // Add emission to surviving ray
+                if (si)
+                    Le += si->intr.Le(-ray.d, lambda);
+                else {
+                    for (const auto &light : infiniteLights)
+                        Le += light.Le(ray, lambda);
+                    return Le * beta;
+                }
+                // Handle surface intersection along ray path
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf){
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                    return beta*(Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth));
+                } else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return Le*beta;
+                }
+
+
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+
+// test
+// new formula but averaged 
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_large_urm(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 4.0/10}, three_modes_u);
+
+            if(three_modes == 0){
+                beta *= 5.0/3;
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction
+                    return SampledSpectrum(0.0f);
+                if (scattered)
+                    continue;
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            } else {
+                beta *= 2.5;
+                if(depth++>=maxDepth)
+                    return SampledSpectrum(0.0f);
+                
+                RayDifferential ori_ray(ray);
+                Float ori_beta = beta;
+                int ori_depth = depth;
+                for(int i=1;i<=512;++i){
+                    // second term
+                    bool scattered = false, terminated = false;
+                    ray = ori_ray;
+                    beta = ori_beta;
+                    depth = ori_depth;
+                    // sample according to sigma_new * Tr_new
+                    Float tMax = si ? si->tHit : Infinity; 
+                    Float u = sampler.Get1D(); // deciding distance
+                    Float uMode = sampler.Get1D(); // deciding mode
+                    // Reserved for unbiased ray marching
+                    Float sample_prob,ODepth_maj;
+                    Point3f p_scatter;
+                    pstd::array<MediumProperties,2> vmpp;
+                    pstd::optional<PhaseFunctionSample> pss;
+                    SampledSpectrum Tr_maj = SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                    [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                    SampledSpectrum T_maj) {
+                                    MediumProperties mp = vmp[1];
+                                    // Compute medium event probabilities for interaction
+                                    vmpp = vmp;
+                                    p_scatter = p;
+                                    ODepth_maj = -std::log(T_maj[0]);
+                                    sample_prob = T_maj[0] * sigma_maj[0];
+
+                                    
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    beta /= sample_prob;
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    pss = ps;
+                                    // ray.o = p;
+                                    // ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                
+                                });
+                    if (terminated){ // terminated due to RR or unable to sample a direction
+                        delta_L += SampledSpectrum(0.0f)/512;
+                        continue;
+                    }
+                    if (scattered){
+                        Float dis = Distance(ray.o,p_scatter);
+                        Float tMax_urm = dis / Length(ray.d);
+                        Float Tr_old,Tr_new;
+                        Tr_urm(ray,tMax_urm,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                        Float dtds = Tr_new * (vmpp[1].sigma_a[0]+vmpp[1].sigma_s[0]);
+                        beta *= dtds;
+                        ray.o = p_scatter;
+                        ray.d = pss->wi;
+                        delta_L += beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth)/512;
+                        continue;
+                    }
+                    beta /= Tr_maj[0];
+                    ODepth_maj = -std::log(Tr_maj[0]);
+                    p_scatter = ray.o + tMax * ray.d;
+                    Float Tr_old,Tr_new;
+                    Tr_urm(ray,tMax,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                    beta *= Tr_new;
+                    SampledSpectrum Le(0.0f);
+                    // Add emission to surviving ray
+                    if (si)
+                        Le += si->intr.Le(-ray.d, lambda);
+                    else {
+                        for (const auto &light : infiniteLights)
+                            Le += light.Le(ray, lambda);
+                        delta_L += Le * beta / 512;
+                        continue;
+                    }
+                    // Handle surface intersection along ray path
+                    BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                    if (!bsdf){
+                        si->intr.SkipIntersection(&ray, si->tHit);
+                        delta_L += beta * (Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth)) / 512;
+                        continue;
+                    } else {
+                        // Report error if BSDF returns a valid sample
+                        Float uc = sampler.Get1D();
+                        Point2f u = sampler.Get2D();
+                        if (bsdf.Sample_f(-ray.d, uc, u))
+                            ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                        else{
+                            delta_L += Le * beta / 512;
+                            continue;
+                        }    
+                    }
+                }
+                for(int i=1;i<=512;++i){
+                    // second term
+                    bool scattered = false, terminated = false;
+                    ray = ori_ray;
+                    beta = ori_beta;
+                    depth = ori_depth;                    
+                    // sample according to sigma_new * Tr_new
+                    Float tMax = si ? si->tHit : Infinity; 
+                    Float u = sampler.Get1D(); // deciding distance
+                    Float uMode = sampler.Get1D(); // deciding mode
+                    // Reserved for unbiased ray marching
+                    Float sample_prob,ODepth_maj;
+                    Point3f p_scatter;
+                    pstd::array<MediumProperties,2> vmpp;
+                    pstd::optional<PhaseFunctionSample> pss;
+                    SampledSpectrum Tr_maj = SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                    [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                    SampledSpectrum T_maj) {
+                                    MediumProperties mp = vmp[0];
+                                    vmpp = vmp;
+                                    p_scatter = p;
+                                    ODepth_maj = -std::log(T_maj[0]);
+                                    sample_prob = T_maj[0] * sigma_maj[0];
+                                    
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    beta /= sample_prob;
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    pss = ps;
+                                    // ray.o = p;
+                                    // ray.d = ps->wi;
+
+                                    scattered = true;
+                                    return false;
+
+                                    
+                                });
+                    if (terminated){ // terminated due to RR or unable to sample a direction
+                        delta_L -= SampledSpectrum(0.0f)/512;
+                        continue;
+                    }
+                    if (scattered){
+                        Float dis = Distance(ray.o,p_scatter);
+                        Float tMax_urm = dis / Length(ray.d);
+                        Float Tr_old,Tr_new;
+                        Tr_urm(ray,tMax_urm,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                        Float dtds = Tr_old * (vmpp[0].sigma_a[0]+vmpp[0].sigma_s[0]);
+                        beta *= dtds;
+                        ray.o = p_scatter;
+                        ray.d = pss->wi;
+                        delta_L -= beta*Li_ori(ray,lambda,sampler,buf,nullptr,depth)/512;
+                        continue;
+                    }
+                    beta /= Tr_maj[0];
+                    ODepth_maj = -std::log(Tr_maj[0]);
+                    p_scatter = ray.o + tMax * ray.d;
+                    Float Tr_old,Tr_new;
+                    Tr_urm(ray,tMax,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                    beta *= Tr_old;
+                    SampledSpectrum Le(0.0f);
+                    // Add emission to surviving ray
+                    if (si)
+                        Le += si->intr.Le(-ray.d, lambda);
+                    else {
+                        for (const auto &light : infiniteLights)
+                            Le += light.Le(ray, lambda);
+                        delta_L -= Le * beta / 512;
+                        continue;
+                    }
+                    // Handle surface intersection along ray path
+                    BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                    if (!bsdf){
+                        si->intr.SkipIntersection(&ray, si->tHit);
+                        delta_L -= beta * (Le + Li_ori(ray, lambda, sampler, buf, nullptr, depth)) / 512;
+                        continue;
+                    } else {
+                        // Report error if BSDF returns a valid sample
+                        Float uc = sampler.Get1D();
+                        Point2f u = sampler.Get2D();
+                        if (bsdf.Sample_f(-ray.d, uc, u))
+                            ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                        else{
+                            delta_L -= Le * beta / 512;
+                            continue;
+                        }    
+                    }
+                }
+                // return here
+                return delta_L;
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+// end buggy
+
+// Third formula using delta tracking 
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_dtrk(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+            // sample according to sigma_new * Tr_new
+            Float tMax = si ? si->tHit : Infinity; 
+            bool scattered = false, terminated = false;
+            Float u = sampler.Get1D(); // deciding distance
+            Float uMode = sampler.Get1D(); // deciding mode
+            SampleT_maj_new(ray, tMax, u, rng, lambda,
+                            [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                            SampledSpectrum T_maj) {
+                            Float pDelta = (vmp[1].sigma_a[0]+vmp[1].sigma_s[0]-vmp[0].sigma_a[0]-vmp[0].sigma_s[0])/sigma_maj[0];
+                            Float sgn = (pDelta < 0.) ? -1. : 1.;
+                            Float pNull = std::max<Float>(0, 1. - pDelta * sgn);
+                            int mode = SampleDiscrete({pNull,pDelta*sgn},uMode);
+                            if(mode == 0){
+                                // Sample delta_L
+                                beta /= pNull;
+                                uMode = rng.Uniform<Float>();
+                                Float pScatter = (vmp[1].sigma_a[0]+vmp[1].sigma_s[0])/sigma_maj[0];
+                                Float pCont = std::max<Float>(0, 1. - pScatter);
+                                int mode2 = SampleDiscrete({pCont,pScatter},uMode);
+                                if (mode2 == 0){
+                                    // Continue
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+                                } else {
+                                    // Scattering
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =vmp[1].phase.Sample_p(-ray.d, u);
+                                    if(!ps)
+                                        LOG_FATAL("Failed to sample phase function!\n");
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+                                }
+                            } else {
+                                // Compute delta_sigma
+                                ray.o = p;
+                                beta *= sgn;
+                                delta_L -= beta * Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+
+                                beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =vmp[1].phase.Sample_p(-ray.d, u);
+                                if(!ps)
+                                    LOG_FATAL("Failed to sample phase function!\n");
+                                beta *= ps->p / ps->pdf;
+                                ray.d = ps->wi;
+                                delta_L += beta * Li_ori(ray,lambda,sampler,buf,nullptr,depth);
+
+                                terminated = true;
+                                return false;
+                            }
+                        });
+            if (terminated) 
+                return delta_L;
+            if (scattered)
+                continue;
+            // No changes in emission; consider direct passing contributions
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return SampledSpectrum(0.0f);
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+// Third formula using delta tracking; exponential evaluation
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_dtrk_exp(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+            // sample according to sigma_new * Tr_new
+            Float tMax = si ? si->tHit : Infinity; 
+            bool scattered = false, terminated = false;
+            Float u = sampler.Get1D(); // deciding distance
+            Float uMode = sampler.Get1D(); // deciding mode
+            SampleT_maj_new(ray, tMax, u, rng, lambda,
+                            [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                            SampledSpectrum T_maj) {
+                            Float pDelta = (vmp[1].sigma_a[0]+vmp[1].sigma_s[0]-vmp[0].sigma_a[0]-vmp[0].sigma_s[0])/sigma_maj[0];
+                            if(std::abs(pDelta) > 1e-7){
+                                // Compute third term
+                                RayDifferential newray(ray);
+                                newray.o = p;
+                                delta_L -= beta * pDelta * Li_ori(newray,lambda,sampler,buf,nullptr,depth);
+
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =vmp[1].phase.Sample_p(-ray.d, u);
+                                if(!ps)
+                                    LOG_FATAL("Failed to sample phase function!\n");
+                                newray.d = ps->wi;
+                                delta_L += beta * pDelta * ps->p / ps->pdf * ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda) * Li_ori(newray,lambda,sampler,buf,nullptr,depth);
+                            }
+                            
+                            // Sample delta_L
+                            Float pScatter = (vmp[1].sigma_a[0]+vmp[1].sigma_s[0])/sigma_maj[0];
+                            Float pCont = std::max<Float>(0, 1. - pScatter);
+                            int mode2 = SampleDiscrete({pCont,pScatter},uMode);
+                            if (mode2 == 0){
+                                // Continue
+                                uMode = rng.Uniform<Float>();
+                                return true;
+                            } else {
+                                // Scattering
+                                if (depth++ >= maxDepth) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =vmp[1].phase.Sample_p(-ray.d, u);
+                                if(!ps)
+                                    LOG_FATAL("Failed to sample phase function!\n");
+                                beta *= ps->p / ps->pdf;
+                                ray.o = p;
+                                ray.d = ps->wi;
+                                scattered = true;
+                                return false;
+                            }
+                                                        
+                        });
+            if (terminated) 
+                return delta_L;
+            if (scattered)
+                continue;
+            // No changes in emission; consider direct passing contributions
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return delta_L; // delta_l+0
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return delta_L;
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+
+
+
+// Use formula of 'large' but evaluate non-recursive term through delta tracking
+// bias? bug?
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_large_dtrk(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // which of the three terms to take?
+            Float three_modes_u = sampler.Get1D();
+            int three_modes = SampleDiscrete({6.0/10, 4.0/10}, three_modes_u);
+
+            if(three_modes == 0){
+                beta *= 5.0/3;
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                bool scattered = false, terminated = false;
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp = vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                if (terminated) // terminated due to RR or unable to sample a direction
+                    return SampledSpectrum(0.0f);
+                if (scattered)
+                    continue;
+                // No changes in emission; consider direct passing contributions
+                BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                if (!bsdf)
+                    si->intr.SkipIntersection(&ray, si->tHit);
+                else {
+                    // Report error if BSDF returns a valid sample
+                    Float uc = sampler.Get1D();
+                    Point2f u = sampler.Get2D();
+                    if (bsdf.Sample_f(-ray.d, uc, u))
+                        ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                    else
+                        return SampledSpectrum(0.0f);
+                }
+            } else {
+                beta *= 2.5;
+                // Using delta tracking formula here
+                Float tMax = si ? si->tHit : Infinity; 
+                Float u = sampler.Get1D(); // deciding distance
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                Float pDelta = (vmp[1].sigma_a[0]+vmp[1].sigma_s[0]-vmp[0].sigma_a[0]-vmp[0].sigma_s[0])/sigma_maj[0];
+                                beta *= pDelta;
+                                if(std::abs(beta) < 1e-7)
+                                    return false;
+                                // alpha * Ls
+                                RayDifferential newray(ray);
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =vmp[1].phase.Sample_p(-ray.d, u);
+                                if(!ps)
+                                    LOG_FATAL("Failed to sample phase function!\n");
+                                newray.o = p;
+                                newray.d = ps->wi;
+                                delta_L += beta * ps->p / ps->pdf * ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda) * 
+                                           Li_ori(newray,lambda,sampler,buf,nullptr,depth);
+                                // -(s_1-s_2)
+                                beta *= -1;
+                                return true;
+                            });
+                return delta_L;
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return delta_L; // delta_L + 0
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+
+
+
+
+// No random selection but exponential expansion
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_delta_exp(RayDifferential ray,
+                                                           SampledWavelengths &lambda, Sampler sampler,
+                                                           ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum delta_L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            { // three_modes == 1
+                Float total_weight=0.0f;
+                Point3f prev_point=ray.o;
+                Float Tr_cur=1.0f;
+                Point3f sampled_point;
+                Float beta_2 = beta;
+                RayDifferential new_ray(ray);
+
+                Float tMax = si ? si->tHit : Infinity; 
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                bool initialized = false;
+                SampleT_maj_new(new_ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj){
+                                MediumProperties mp=vmp[1];
+                                Float d=Distance(p,prev_point);
+                                total_weight+=d*Tr_cur;
+                                
+                                if(!initialized){
+                                    //first time: sample a point on the segment
+                                    initialized=true;
+                                    sampled_point=prev_point+Normalize(new_ray.d)*d*uMode;
+                                }else{
+                                    if(rng.Uniform<Float>() < d*Tr_cur/total_weight){
+                                        //resample a point
+                                        sampled_point=prev_point+Normalize(new_ray.d)*d*rng.Uniform<Float>();
+                                    }
+                                }
+                                prev_point=p;
+                                Tr_cur *= std::max<Float>(0, 1.0-(mp.sigma_a[0]+mp.sigma_s[0])/sigma_maj[0]);
+                                return true;
+                            });
+                //Compute the final segment
+                CHECK(si); // the medium should not reach infinity...OR COULD THEY?
+                Float d=si->tHit*Length(new_ray.d)-Distance(new_ray.o,prev_point);
+                total_weight+=d*Tr_cur;
+                if(!initialized){
+                    //first time: sample a point on the segment
+                    initialized=true;
+                    sampled_point=prev_point+Normalize(new_ray.d)*d*uMode;
+                }else{
+                    if(rng.Uniform<Float>() < d*Tr_cur/total_weight){
+                        //resample a point
+                        sampled_point=prev_point+Normalize(new_ray.d)*d*rng.Uniform<Float>();
+                    }
+                }
+                // Ended reservoir sampling and update beta
+                pstd::array<MediumProperties,2> vmp=new_ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(sampled_point,lambda);
+                Float delta_sigma=vmp[1].sigma_a[0]+vmp[1].sigma_s[0]-vmp[0].sigma_a[0]-vmp[0].sigma_s[0];
+                beta_2 *= delta_sigma * total_weight * new_ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+
+                // Sample New Ray!
+                Point2f u_point{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                pstd::optional<PhaseFunctionSample> ps =
+                    vmp[1].phase.Sample_p(-new_ray.d, u_point);
+                if (ps) {
+                    beta_2 *= ps->p / ps->pdf;
+                    new_ray.o = sampled_point;
+                    new_ray.d = ps->wi;
+                    delta_L += beta_2 * Li_ori(new_ray,lambda,sampler,buf,nullptr,depth);
+                }
+                
+            }
+
+            { // three_modes == 2
+                Float beta_3 = beta;
+                Float Tr_old = 1.0f, Tr_new = 1.0f;
+                bool scattered = false, terminated = false;
+
+                Float tMax = si ? si->tHit : Infinity; 
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                RayDifferential new_ray(ray);
+                SampleT_maj_old(new_ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp=vmp[0];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    Tr_old *= pNull;
+                                    Tr_new *= std::max<Float>(0, 1.0-(vmp[1].sigma_a[0]+vmp[1].sigma_s[0])/sigma_maj[0]);
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    // beta *= pScatter / (pAbsorb + pScatter);
+                                    beta_3 *= new_ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    // CHECK: DO I NEED THIS ????????????????????????????????????????????????????? // BETTER GET RID OF IT
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-new_ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+                                    // Critical here! delta_Tr/Tr
+                                    beta_3 *= (Tr_new-Tr_old)/Tr_old;
+                                    beta_3 *= ps->p / ps->pdf;
+                                    new_ray.o = p;
+                                    new_ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                if (!terminated){
+                    if (scattered)
+                        delta_L += beta_3*Li_ori(new_ray,lambda,sampler,buf,nullptr,depth);
+                    else{
+                        //calculate incoming radiance then delta_Tr/Tr
+                        beta_3 *= (Tr_new-Tr_old)/Tr_old;
+                        SampledSpectrum Le(0.0f);
+                        // Add emission to surviving ray
+                        if (si){
+                            Le += si->intr.Le(-new_ray.d, lambda);
+                            // Handle surface intersection along ray path
+                            BSDF bsdf = si->intr.GetBSDF(new_ray, lambda, camera, buf, sampler);
+                            if (!bsdf){
+                                si->intr.SkipIntersection(&new_ray, si->tHit);
+                                delta_L += beta_3*(Le + Li_ori(new_ray, lambda, sampler, buf, nullptr, depth));
+                            } else {
+                                // Report error if BSDF returns a valid sample
+                                Float uc = sampler.Get1D();
+                                Point2f u = sampler.Get2D();
+                                if (bsdf.Sample_f(-new_ray.d, uc, u))
+                                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                                else
+                                    delta_L += Le*beta_3;
+                            }
+                        } else {
+                            for (const auto &light : infiniteLights)
+                                Le += light.Le(new_ray, lambda);
+                            delta_L += Le * beta_3;
+                        }
+                        
+                    }
+                }
+
+            }
+
+            {
+                // sample according to sigma_new * Tr_new
+                Float tMax = si ? si->tHit : Infinity; 
+                Float u = sampler.Get1D(); // deciding distance
+                Float uMode = sampler.Get1D(); // deciding mode
+                bool scattered = false, terminated = false;
+                SampleT_maj_new(ray, tMax, u, rng, lambda,
+                                [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                                SampledSpectrum T_maj) {
+                                MediumProperties mp=vmp[1];
+                                // Compute medium event probabilities for interaction
+                                Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                                Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                                Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                                // Randomly sample medium scattering event for delta tracking
+                                int mode = SampleDiscrete({pNull, pAbsorb+pScatter}, uMode);
+                                if (mode == 0) {
+                                    // Handle null-scattering event for medium sample
+                                    uMode = rng.Uniform<Float>();
+                                    return true;
+
+                                } else {
+                                    // Handle regular scattering event for medium sample
+                                    //beta *= pScatter / (pAbsorb + pScatter);
+                                    beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                                    // Stop path sampling if maximum depth has been reached
+                                    if (depth++ >= maxDepth) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Sample phase function for medium scattering event
+                                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                    pstd::optional<PhaseFunctionSample> ps =
+                                        mp.phase.Sample_p(-ray.d, u);
+                                    if (!ps) {
+                                        terminated = true;
+                                        return false;
+                                    }
+
+                                    // Update state for recursive evaluation of $L_\roman{i}$
+                                    beta *= ps->p / ps->pdf;
+                                    ray.o = p;
+                                    ray.d = ps->wi;
+                                    scattered = true;
+                                    return false;
+
+                                }
+                            });
+                // Handle terminated and unscattered rays after medium sampling
+                if (terminated) // terminated due to RR or unable to sample a direction
+                    return delta_L;
+                if (scattered){
+                    continue;
+                }
+
+                // boundary conditions 
+                {
+                    // No changes in emission; consider direct passing contributions
+                    BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+                    if (!bsdf)
+                        si->intr.SkipIntersection(&ray, si->tHit);
+                    else {
+                        // Report error if BSDF returns a valid sample
+                        Float uc = sampler.Get1D();
+                        Point2f u = sampler.Get2D();
+                        if (bsdf.Sample_f(-ray.d, uc, u))
+                            ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                        else
+                            return delta_L;
+                    }
+                }
+
+            }
+
+        } else {
+            // No need for sampling the three strategies; only need delta_Ls
+            if(!si) return delta_L;
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    return delta_L;
+            }
+        }
+
+    }
+    return delta_L;
+}
+
+// Naive implementation: just subtract two pics
+SampledSpectrum SimpleVolPathDeltaIntegrator::Li_naive(RayDifferential ray,
+                                                       SampledWavelengths &lambda, Sampler sampler,
+                                                       ScratchBuffer &buf, VisibleSurface *) const {
+    RayDifferential ori_ray(ray);
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+    
+    // Declare local variables for delta tracking integration
+    SampledSpectrum L_new(0.f);
+    Float beta_new = 1.f;
+    int depth_new = 0;
+    
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        bool scattered = false, terminated = false;
+        if (ray.medium) {
+            if(!ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            // Initialize _RNG_ for sampling the majorant transmittance
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+            
+            // Sample medium using delta tracking
+            Float tMax = si ? si->tHit : Infinity;
+            Float u = sampler.Get1D();
+            Float uMode = sampler.Get1D();
+            SampleT_maj_new(ray, tMax, u, rng, lambda,
+                            [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                            SampledSpectrum T_maj) {
+                            MediumProperties mp=vmp[1];
+                            // Compute medium event probabilities for interaction
+                            Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                            Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                            Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                            // Randomly sample medium scattering event for delta tracking
+                            int mode = SampleDiscrete({pAbsorb, pScatter, pNull}, uMode);
+                            if (mode == 0) {
+                                // Handle absorption event for medium sample
+                                L_new += beta_new * mp.Le;
+                                terminated = true;
+                                return false;
+
+                            } else if (mode == 1) {
+                                // Handle regular scattering event for medium sample
+                                // Stop path sampling if maximum depth has been reached
+                                if (depth_new++ >= maxDepth) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Sample phase function for medium scattering event
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =
+                                    mp.phase.Sample_p(-ray.d, u);
+                                if (!ps) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Update state for recursive evaluation of $L_\roman{i}$
+                                beta_new *= ps->p / ps->pdf;
+                                ray.o = p;
+                                ray.d = ps->wi;
+                                scattered = true;
+                                return false;
+
+                            } else {
+                                // Handle null-scattering event for medium sample
+                                uMode = rng.Uniform<Float>();
+                                return true;
+                            }
+                        });
+        }
+        // Handle terminated and unscattered rays after medium sampling
+        if (terminated)
+            break;
+        if (scattered)
+            continue;
+        // Add emission to surviving ray
+        if (si)
+            L_new += beta_new * si->intr.Le(-ray.d, lambda);
+        else {
+            for (const auto &light : infiniteLights)
+                L_new += beta_new * light.Le(ray, lambda);
+            break;
+        }
+
+        // Handle surface intersection along ray path
+        BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+        if (!bsdf)
+            si->intr.SkipIntersection(&ray, si->tHit);
+        else {
+            // Report error if BSDF returns a valid sample
+            Float uc = sampler.Get1D();
+            Point2f u = sampler.Get2D();
+            if (bsdf.Sample_f(-ray.d, uc, u))
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support surface scattering.");
+            else
+                break;
+        }
+    }
+    //LOG_VERBOSE("L_new=%s\n",L_new);
+    //ray=ori_ray;
+    // Declare local variables for delta tracking integration
+    SampledSpectrum L_old(0.f);
+    Float beta_old = 1.f;
+    int depth_old = 0;
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ori_ray);
+        bool scattered = false, terminated = false;
+        if (ori_ray.medium) {
+            if(!ori_ray.medium.Is<DeltaGridMedium>())
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support medium types other than deltagrid.");
+            // Initialize _RNG_ for sampling the majorant transmittance
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // Sample medium using delta tracking
+            Float tMax = si ? si->tHit : Infinity;
+            Float u = sampler.Get1D();
+            Float uMode = sampler.Get1D();
+            SampleT_maj_old(ori_ray, tMax, u, rng, lambda,
+                        [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                            SampledSpectrum T_maj) {
+                            MediumProperties mp=vmp[0];
+                            // Compute medium event probabilities for interaction
+                            Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+                            Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+                            Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
+
+                            // Randomly sample medium scattering event for delta tracking
+                            int mode = SampleDiscrete({pAbsorb, pScatter, pNull}, uMode);
+                            if (mode == 0) {
+                                // Handle absorption event for medium sample
+                                L_old += beta_old * mp.Le;
+                                terminated = true;
+                                return false;
+
+                            } else if (mode == 1) {
+                                // Handle regular scattering event for medium sample
+                                // Stop path sampling if maximum depth has been reached
+                                if (depth_old++ >= maxDepth) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Sample phase function for medium scattering event
+                                Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                                pstd::optional<PhaseFunctionSample> ps =
+                                    mp.phase.Sample_p(-ori_ray.d, u);
+                                if (!ps) {
+                                    terminated = true;
+                                    return false;
+                                }
+
+                                // Update state for recursive evaluation of $L_\roman{i}$
+                                beta_old *= ps->p / ps->pdf;
+                                ori_ray.o = p;
+                                ori_ray.d = ps->wi;
+                                scattered = true;
+                                return false;
+
+                            } else {
+                                // Handle null-scattering event for medium sample
+                                uMode = rng.Uniform<Float>();
+                                return true;
+                            }
+                        });
+        }
+        // Handle terminated and unscattered rays after medium sampling
+        if (terminated)
+            break;
+        if (scattered)
+            continue;
+        // Add emission to surviving ray
+        if (si)
+            L_old += beta_old * si->intr.Le(-ori_ray.d, lambda);
+        else {
+            for (const auto &light : infiniteLights)
+                L_old += beta_old * light.Le(ori_ray, lambda);
+            break;
+        }
+
+        // Handle surface intersection along ray path
+        BSDF bsdf = si->intr.GetBSDF(ori_ray, lambda, camera, buf, sampler);
+        if (!bsdf)
+            si->intr.SkipIntersection(&ori_ray, si->tHit);
+        else {
+            // Report error if BSDF returns a valid sample
+            Float uc = sampler.Get1D();
+            Point2f u = sampler.Get2D();
+            if (bsdf.Sample_f(-ori_ray.d, uc, u))
+                ErrorExit("SimpleVolPathDeltaIntegrator doesn't support surface scattering.");
+            else
+                break;
+        }
+    }
+    //LOG_VERBOSE("L_old=%s\n",L_old);
+    //LOG_VERBOSE("delta_Li=%s\n",L_new-L_old);
+    return L_new-L_old;
+}
+
+
+
+// Quack Quack !!
+
+// BiasedVolPathDeltaIntegrator Method Definitions
+BiasedVolPathDeltaIntegrator::BiasedVolPathDeltaIntegrator(int maxDepth, Camera camera,
+                                                           Sampler sampler, Primitive aggregate,
+                                                           std::vector<Light> lights)
+    : RayIntegrator(camera, sampler, aggregate, lights), maxDepth(maxDepth) {
+    for (Light light : lights) {
+        if (IsDeltaLight(light.Type()))
+            ErrorExit("BiasedVolPathIntegrator only supports area and infinite light "
+                      "sources");
+    }
+}
+
+std::string BiasedVolPathDeltaIntegrator::ToString() const {
+    return StringPrintf("[ BiasedVolPathDeltaIntegrator maxDepth: %d ] ", maxDepth);
+}
+
+std::unique_ptr<BiasedVolPathDeltaIntegrator> BiasedVolPathDeltaIntegrator::Create(
+    const ParameterDictionary &parameters, Camera camera, Sampler sampler,
+    Primitive aggregate, std::vector<Light> lights, const FileLoc *loc) {
+    int maxDepth = parameters.GetOneInt("maxdepth", 10);
+    return std::make_unique<BiasedVolPathDeltaIntegrator>(maxDepth, camera, sampler, aggregate,
+                                                          lights);
+}
+
+
+// using biased transmittance estimates
+/*
+SampledSpectrum BiasedVolPathDeltaIntegrator::Li(RayDifferential ray,
+                                                 SampledWavelengths &lambda, Sampler sampler,
+                                                 ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        bool scattered = false, terminated = false;
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // Sample medium using delta tracking
+            Float tMax = si ? si->tHit : Infinity;
+            Float u = sampler.Get1D();
+            Float densityAtT;
+            Point3f p_scatter;
+            if(InvertDensityIntegral_Simpson(ray,tMax,u,lambda,densityAtT,p_scatter)){
+                // Update beta using albedo
+                MediumProperties mp = ray.medium.SamplePoint(p_scatter,lambda);
+                beta *= mp.sigma_s[0] / std::max(mp.sigma_a[0]+mp.sigma_s[0],densityAtT);// danger here!
+                // Handle regular scattering event for medium sample
+                // Stop path sampling if maximum depth has been reached
+                if (depth++ >= maxDepth) {
+                    terminated = true;
+                } else{
+                    // Sample phase function for medium scattering event
+                    Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                    
+                    pstd::optional<PhaseFunctionSample> ps =
+                        mp.phase.Sample_p(-ray.d, u);
+                    if (!ps) {
+                        terminated = true;
+                    } else {
+                        // Update state for recursive evaluation of $L_\roman{i}$
+                        beta *= ps->p / ps->pdf;
+                        ray.o = p_scatter;
+                        ray.d = ps->wi;
+                        scattered = true;                        
+                    }
+                }
+            }
+
+        }
+        // Handle terminated and unscattered rays after medium sampling
+        if (terminated)
+            return L;
+        if (scattered)
+            continue;
+        // Add emission to surviving ray
+        if (si)
+            L += beta * si->intr.Le(-ray.d, lambda);
+        else {
+            for (const auto &light : infiniteLights)
+                L += beta * light.Le(ray, lambda);
+            return L;
+        }
+
+        // Handle surface intersection along ray path
+        BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+        if (!bsdf)
+            si->intr.SkipIntersection(&ray, si->tHit);
+        else {
+            // Report error if BSDF returns a valid sample
+            Float uc = sampler.Get1D();
+            Point2f u = sampler.Get2D();
+            if (bsdf.Sample_f(-ray.d, uc, u))
+                ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+            else
+                break;
+        }
+    }
+    return L;
+}
+*/
+
+void BiasedVolPathDeltaIntegrator::Tr_urm(Ray ray, Float tMax, const SampledWavelengths &lambda, ScratchBuffer &scratchbuffer, RNG &rng, Float &Tr_old, Float &Tr_new, Float ODepth_maj) const{
+    // determine rank
+    Float u = rng.Uniform<Float>();
+    int N = 0;
+    if(u > 0.1f) N = 0;
+    else{
+        Float P = 0.1f;
+        N = 2;
+        while(N <= 8){
+            N++;
+            P *= 2./N;
+            if(u > P) break;
+        }
+        N--;
+    }
+    //DEBUG TEST HERE!
+    // N = 2;
+
+    // create N+1 estimators for optical depth
+    int M = 50;
+    auto estimators_old = scratchbuffer.Alloc<Float[]>(N+1);
+    auto estimators_new = scratchbuffer.Alloc<Float[]>(N+1);
+    pstd::array<MediumProperties,2> vmp_0 = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(ray.o,lambda);
+    pstd::array<MediumProperties,2> vmp_tmax = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(ray(tMax),lambda);
+    Float mu_0_old = vmp_0[0].sigma_a[0]+vmp_0[0].sigma_s[0];
+    Float mu_0_new = vmp_0[1].sigma_a[0]+vmp_0[1].sigma_s[0];
+    Float mu_tmax_old = vmp_tmax[0].sigma_a[0]+vmp_tmax[0].sigma_s[0];
+    Float mu_tmax_new = vmp_tmax[1].sigma_a[0]+vmp_tmax[1].sigma_s[0];
+    for(int i=0;i<N+1;++i){
+        u = rng.Uniform<Float>();
+        estimators_old[i] = 0.0f;
+        estimators_new[i] = 0.0f;
+        // Use uniform sampling and endpoint matching
+        // for(int j=0;j<M;++j){
+        //     pstd::array<MediumProperties,2> vmp = ray.medium.Cast<DeltaGridMedium>()->SamplePoint_both(ray(tMax*(j+u)/M),lambda);
+        //     estimators_old[i] += vmp[0].sigma_a[0]+vmp[0].sigma_s[0];
+        //     estimators_new[i] += vmp[1].sigma_a[0]+vmp[1].sigma_s[0];
+        // }
+        // estimators_old[i] *= -tMax / M * Length(ray.d);
+        // estimators_old[i] -= tMax / M * Length(ray.d) * (0.5f - u) * (mu_tmax_old - mu_0_old);
+        // estimators_new[i] *= -tMax / M * Length(ray.d);
+        // estimators_new[i] -= tMax / M * Length(ray.d) * (0.5f - u) * (mu_tmax_new - mu_0_new);
+
+        // Use pdf porportional to sigma_maj / ODepth_maj
+        ray.medium.Cast<DeltaGridMedium>()->SampleODepth_both(ray,tMax,u,lambda,ODepth_maj,M,estimators_old[i],estimators_new[i]);
+        estimators_old[i] *= -1.;
+        estimators_new[i] *= -1.;
+    }
+    // Compute elementary means
+    Tr_old = 0.f, Tr_new = 0.f;
+    auto elem_means_old = scratchbuffer.Alloc<Float[]>(N+1);
+    auto elem_means_new = scratchbuffer.Alloc<Float[]>(N+1);
+    for(int i=0;i<N+1;++i){
+        //using the i-th estimator as pivot and average others
+        elem_means_old[0] = elem_means_new[0] = 1.;
+        for(int j=1;j<N+1;++j) elem_means_old[j] = elem_means_new[j] = 0.;
+        for(int j=1;j<N+1;++j){
+            Float x = (j<=i) ? (estimators_old[j-1]-estimators_old[i]) : (estimators_old[j]-estimators_old[i]);
+            Float y = (j<=i) ? (estimators_new[j-1]-estimators_new[i]) : (estimators_new[j]-estimators_new[i]);
+            for(int k=j;k>0;--k){
+                elem_means_old[k] += 1. * k * (elem_means_old[k-1]*x-elem_means_old[k]) / j;
+                elem_means_new[k] += 1. * k * (elem_means_new[k-1]*y-elem_means_new[k]) / j;
+            }
+        }
+        Float multiplier_old = FastExp(estimators_old[i])/(N+1);
+        Float multiplier_new = FastExp(estimators_new[i])/(N+1);
+        Float P = 1.f;
+        for(int j=0;j<N+1;++j){
+            if(j==0) P=1.;
+            else if(j==1) P=0.1;
+            else P*=2.;
+            Tr_old += multiplier_old * elem_means_old[j] / P;
+            Tr_new += multiplier_new * elem_means_new[j] / P;
+            if(IsNaN(Tr_old)||IsNaN(Tr_new))
+                LOG_VERBOSE("FATAL: NAN HERE in Tr: j %d elem_means_old %f elem_means_new %f P %f",j,elem_means_old[j],elem_means_new[j],P);
+        }
+    }
+  
+}
+
+SampledSpectrum BiasedVolPathDeltaIntegrator::Li(RayDifferential ray,
+                                                 SampledWavelengths &lambda, Sampler sampler,
+                                                 ScratchBuffer &buf, VisibleSurface *) const {
+    // Declare local variables for delta tracking integration
+    SampledSpectrum L(0.f);
+    Float beta = 1.f;
+    int depth = 0;
+
+    // Terminate secondary wavelengths before starting random walk
+    lambda.TerminateSecondary();
+
+    while (true) {
+        // Estimate radiance for ray path using delta tracking
+        pstd::optional<ShapeIntersection> si = Intersect(ray);
+        bool scattered = false, terminated = false;
+        if (ray.medium) {
+            // Initialize _RNG_ for sampling the majorant transmittance
+            // ray.medium.Cast<DeltaGridMedium>()->DebugTest(lambda);
+            uint64_t hash0 = Hash(sampler.Get1D());
+            uint64_t hash1 = Hash(sampler.Get1D());
+            RNG rng(hash0, hash1);
+
+            // Sample medium using delta tracking
+            Float tMax = si ? si->tHit : Infinity;
+            Float u = sampler.Get1D();
+            Float uMode = sampler.Get1D();
+            SampledSpectrum Tr_maj = SampleT_maj_old(ray, tMax, u, rng, lambda,
+                        [&](Point3f p, pstd::array<MediumProperties,2> vmp, SampledSpectrum sigma_maj,
+                            SampledSpectrum T_maj) {
+                            // Assume no absorption here
+                            // Instead of delta tracking, we explicitly compute sampling prob.
+                            // and use urm to compute sigma*T
+                                                        
+                            // Stop path sampling if maximum depth has been reached
+                            if (depth++ >= maxDepth) {
+                                terminated = true;
+                                return false;
+                            }
+
+                            Float sample_prob = sigma_maj[0]*T_maj[0];
+                            Float ODepth_maj = -std::log(T_maj[0]);
+                            beta *= ray.medium.Cast<DeltaGridMedium>()->SampleAlbedo0(lambda);
+                            beta /= sample_prob;
+                            Float dis = Distance(ray.o,p);
+                            Float tMax_urm = dis / Length(ray.d);
+                            Float Tr_old,Tr_new;
+                            Tr_urm(ray,tMax_urm,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+                            Float dtds = Tr_old * (vmp[0].sigma_a[0]+vmp[0].sigma_s[0]);
+                            // LOG_VERBOSE("Depth:%d dtds:%lf Tr:%lf sigma:%lf sigma_maj:%lf samplingProb:%lf cdf:%lf\n",depth,dtds,Tr_old,(vmp[0].sigma_a[0]+vmp[0].sigma_s[0]),sigma_maj[0],sample_prob,T_maj[0]);
+                            beta *= dtds;                            
+
+                            // Sample phase function for medium scattering event
+                            Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
+                            pstd::optional<PhaseFunctionSample> ps =
+                                vmp[0].phase.Sample_p(-ray.d, u);
+                            if (!ps) {
+                                terminated = true;
+                                return false;
+                            }
+
+                            // Update state for recursive evaluation of $L_\roman{i}$
+                            beta *= ps->p / ps->pdf;
+                            ray.o = p;
+                            ray.d = ps->wi;
+                            // LOG_VERBOSE("Depth:%d beta:%lf origin:%s dir:%s\n",depth,beta,ray.o,ray.d);
+                            scattered = true;
+                            return false;
+
+                        });
+            // Handle terminated and unscattered rays after medium sampling
+            if (terminated)
+                return L;
+            if (scattered)
+                continue;
+            Float sample_prob = Tr_maj[0];
+            Float ODepth_maj = -std::log(Tr_maj[0]);
+            beta /= sample_prob;
+            Float Tr_old,Tr_new;
+            Tr_urm(ray,tMax,lambda,buf,rng,Tr_old,Tr_new,ODepth_maj);
+            Float dtds = Tr_old;
+            beta *= dtds;
+            // LOG_VERBOSE("Exited: depth:%d beta:%lf\n",depth,beta);
+            // Add emission to surviving ray
+            if (si)
+                L += beta * si->intr.Le(-ray.d, lambda);
+            else {
+                for (const auto &light : infiniteLights)
+                    L += beta * light.Le(ray, lambda);
+                return L;
+            }
+
+            // Handle surface intersection along ray path
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    break;
+            }            
+        } else {
+            // Handle boundary directly
+            // Add emission to surviving ray
+            if (si)
+                L += beta * si->intr.Le(-ray.d, lambda);
+            else {
+                for (const auto &light : infiniteLights)
+                    L += beta * light.Le(ray, lambda);
+                return L;
+            }
+
+            // Handle surface intersection along ray path
+            BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
+            if (!bsdf)
+                si->intr.SkipIntersection(&ray, si->tHit);
+            else {
+                // Report error if BSDF returns a valid sample
+                Float uc = sampler.Get1D();
+                Point2f u = sampler.Get2D();
+                if (bsdf.Sample_f(-ray.d, uc, u))
+                    ErrorExit("SimpleVolPathIntegrator doesn't support surface scattering.");
+                else
+                    break;
+            }
+        }
+
+    }
+    return L;
+}
+
+bool BiasedVolPathDeltaIntegrator::InvertDensityIntegral_Simpson(Ray ray, Float tMax, Float desiredDensity, const SampledWavelengths &lambda, Float &densityAtT, Point3f &p_scatter)const{
+    
+    auto SampleSigmaT = ([ray,lambda](Point3f p){
+        auto mp = ray.medium.SamplePoint(p,lambda);
+        return mp.sigma_a[0] + mp.sigma_s[0];
+    });
+    
+    // Normalize ray direction and update _tMax_ accordingly
+    tMax *= Length(ray.d);
+    ray.d = Normalize(ray.d);
+    Float integratedDensity = 0.f;
+
+    // calculate the corresponding path step size
+    Float stepSize = 2e-3f; // due to lack of API, set according to the PARTICULAR SCENE! 
+
+    // adjust stepsize
+    uint32_t nSteps = (uint32_t)std::ceil(tMax/(2*stepSize));
+    stepSize = tMax/nSteps;
+    Float multiplier = 1.f/6.f * stepSize;
+    Vector3f fullStep = stepSize * ray.d, halfStep = 0.5f * fullStep;
+
+    Point3f p_current = ray.o, p_last = ray(tMax);
+    Float node1 = SampleSigmaT(p_current);
+    for(uint32_t i=0; i<nSteps; ++i){
+        Float node2 = SampleSigmaT(p_current + halfStep),
+        node3 = SampleSigmaT(p_current + fullStep),
+        newDensity = integratedDensity + multiplier * (node1+4*node2+node3);
+        if(newDensity >= desiredDensity){
+            // Newton-Bisection method 
+            Float a=0, b=stepSize, x=a,
+            fx = integratedDensity - desiredDensity,
+            temp = 1/(stepSize*stepSize);
+            int it = 1;
+            while(true){
+                Float dfx = temp * (node1*stepSize*stepSize-
+                (3*node1-4*node2+node3)*stepSize*x+2*(node1-2*node2+node3)*x*x);
+                x -= fx/dfx;
+                if(dfx == 0 || x<=a || x>=b) x=0.5f*(a+b);
+
+                Float intval = integratedDensity + temp*1.f/6.f*x*(6*stepSize*stepSize*node1
+                -3*(3*node1-4*node2+node3)*stepSize*x+4*(node1-2*node2+node3)*x*x);
+                fx = intval - desiredDensity;
+                
+                if(std::abs(fx) < 1e-6f){
+                    p_scatter = p_current + x * ray.d;
+                    densityAtT = temp * (node1*stepSize*stepSize-
+                               (3*node1-4*node2+node3)*stepSize*x+2*(node1-2*node2+node3)*x*x);
+                    return true;
+                } else if(++it > 30){
+                    LOG_VERBOSE("Stuck in Newton-Bisection: step size %f, fx %f, dfx %f  a %f, b %f",stepSize,fx,dfx,a,b);
+                    return false;
+                }
+
+                if(fx>0) b=x;
+                else a=x;
+            }
+        }
+
+        Point3f next = p_current + fullStep;
+        // TODO: SHOULD I WARN HERE LIKE MITSUBA DID?
+        integratedDensity = newDensity;
+        node1 = node3;
+        p_current = next;
+    }
+    return false;
+}
+
+
+
 STAT_COUNTER("Integrator/Volume interactions", volumeInteractions);
 STAT_COUNTER("Integrator/Surface interactions", surfaceInteractions);
 
@@ -3661,6 +7326,12 @@ std::unique_ptr<Integrator> Integrator::Create(
                                                  lights, loc);
     else if (name == "simplevolpath")
         integrator = SimpleVolPathIntegrator::Create(parameters, camera, sampler,
+                                                     aggregate, lights, loc);
+    else if (name == "simplevolpathdelta")
+        integrator = SimpleVolPathDeltaIntegrator::Create(parameters, camera, sampler,
+                                                     aggregate, lights, loc);
+    else if (name == "biasedvolpathdelta")
+        integrator = BiasedVolPathDeltaIntegrator::Create(parameters, camera, sampler,
                                                      aggregate, lights, loc);
     else if (name == "volpath")
         integrator = VolPathIntegrator::Create(parameters, camera, sampler, aggregate,

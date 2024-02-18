@@ -156,6 +156,15 @@ bool Image::HasAnyNaNPixels() const {
     return false;
 }
 
+void Image::SetPixelsToPositive(){
+    for (int y = 0; y < resolution.y; ++y)
+        for (int x = 0; x < resolution.x; ++x)
+            for (int c = 0; c < NChannels(); ++c){
+                pbrt::Float val=GetChannel({x, y}, c);
+                if(val<0.0) SetChannel({x,y},c,-val);
+            }
+}
+
 Image Image::GaussianFilter(const ImageChannelDesc &desc, int halfWidth,
                             Float sigma) const {
     // Compute filter weights

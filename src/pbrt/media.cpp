@@ -335,6 +335,144 @@ std::string GridMedium::ToString() const {
                         bounds, renderFromMedium, phase, LeScale);
 }
 
+// Quack Quack!
+
+// DeltaGridMedium Method Definitions
+DeltaGridMedium::DeltaGridMedium(const Bounds3f &bounds, const Transform &renderFromMedium,
+                                 Spectrum sigma_a, Spectrum sigma_s, Float sigmaScale, Float g,
+                                 SampledGrid<Float> d_old, SampledGrid<Float> d_new,
+                                 pstd::optional<SampledGrid<Float>> temperature,
+                                 Float temperatureScale, Float temperatureOffset,
+                                 Spectrum Le, SampledGrid<Float> LeGrid, Allocator alloc)
+    : bounds(bounds),
+      renderFromMedium(renderFromMedium),
+      sigma_a_spec(sigma_a, alloc),
+      sigma_s_spec(sigma_s, alloc),
+      densityGrid_old(std::move(d_old)),
+      densityGrid_new(std::move(d_new)),
+      phase(g),
+      temperatureGrid(std::move(temperature)),
+      temperatureScale(temperatureScale),
+      temperatureOffset(temperatureOffset),
+      Le_spec(Le, alloc),
+      LeScale(std::move(LeGrid)),
+      majorantGrid(bounds, {64, 64, 64}, alloc) {
+    sigma_a_spec.Scale(sigmaScale);
+    sigma_s_spec.Scale(sigmaScale);
+
+    volumeGridBytes += LeScale.BytesAllocated();
+    volumeGridBytes += densityGrid_old.BytesAllocated();
+    volumeGridBytes += densityGrid_new.BytesAllocated();
+    if (temperatureGrid)
+        volumeGridBytes += temperatureGrid->BytesAllocated();
+
+    isEmissive = temperatureGrid ? true : (Le_spec.MaxValue() > 0);
+
+    // Initialize _majorantGrid_ for _DeltaGridMedium_
+    for (int z = 0; z < majorantGrid.res.z; ++z)
+        for (int y = 0; y < majorantGrid.res.y; ++y)
+            for (int x = 0; x < majorantGrid.res.x; ++x) {
+                Bounds3f bounds = majorantGrid.VoxelBounds(x, y, z);
+                majorantGrid.Set(x, y, z, std::max(densityGrid_old.MaxValue(bounds),densityGrid_new.MaxValue(bounds)));
+            }
+}
+
+DeltaGridMedium *DeltaGridMedium::Create(const ParameterDictionary &parameters,
+                                         const Transform &renderFromMedium, const FileLoc *loc,
+                                         Allocator alloc) {
+    std::vector<Float> density_old = parameters.GetFloatArray("density_old");
+    std::vector<Float> density_new = parameters.GetFloatArray("density_new");
+    std::vector<Float> temperature = parameters.GetFloatArray("temperature");
+
+    size_t nDensity;
+    if (density_old.empty()||density_new.empty())
+        ErrorExit(loc, "No \"density\" value provided for grid medium.");
+    nDensity = density_old.size();
+    if (density_new.size()!=nDensity)
+        ErrorExit(loc,
+                  "Different number of samples (%d vs %d) provided for "
+                  "\"old_density\" and \"new_density\".",
+                  nDensity, density_new.size());
+
+    if (!temperature.empty())
+        if (nDensity != temperature.size())
+            ErrorExit(loc,
+                      "Different number of samples (%d vs %d) provided for "
+                      "\"density\" and \"temperature\".",
+                      nDensity, temperature.size());
+
+    int nx = parameters.GetOneInt("nx", 1);
+    int ny = parameters.GetOneInt("ny", 1);
+    int nz = parameters.GetOneInt("nz", 1);
+    if (nDensity != nx * ny * nz)
+        ErrorExit(loc, "Grid medium has %d density values; expected nx*ny*nz = %d",
+                  nDensity, nx * ny * nz);
+
+    // Create Density Grid
+    SampledGrid<Float> densityGrid_old = SampledGrid<Float>(density_old, nx, ny, nz, alloc);
+    SampledGrid<Float> densityGrid_new = SampledGrid<Float>(density_new, nx, ny, nz, alloc);
+
+    pstd::optional<SampledGrid<Float>> temperatureGrid;
+    if (temperature.size())
+        temperatureGrid = SampledGrid<Float>(temperature, nx, ny, nz, alloc);
+
+    Spectrum Le =
+        parameters.GetOneSpectrum("Le", nullptr, SpectrumType::Illuminant, alloc);
+
+    if (Le && !temperature.empty())
+        ErrorExit(loc, "Both \"Le\" and \"temperature\" values were provided.");
+
+    Float LeNorm = 1;
+    if (!Le || Le.MaxValue() == 0)
+        Le = alloc.new_object<ConstantSpectrum>(0.f);
+    else
+        LeNorm = 1 / SpectrumToPhotometric(Le);
+
+    SampledGrid<Float> LeGrid(alloc);
+    std::vector<Float> LeScale = parameters.GetFloatArray("Lescale");
+
+    if (LeScale.empty())
+        LeGrid = SampledGrid<Float>({LeNorm}, 1, 1, 1, alloc);
+    else {
+        if (LeScale.size() != nx * ny * nz)
+            ErrorExit("Expected %d x %d %d = %d values for \"Lescale\" but were "
+                      "given %d.",
+                      nx, ny, nz, nx * ny * nz, LeScale.size());
+        for (int i = 0; i < nx * ny * nz; ++i)
+            LeScale[i] *= LeNorm;
+        LeGrid = SampledGrid<Float>(LeScale, nx, ny, nz, alloc);
+    }
+
+    Point3f p0 = parameters.GetOnePoint3f("p0", Point3f(0.f, 0.f, 0.f));
+    Point3f p1 = parameters.GetOnePoint3f("p1", Point3f(1.f, 1.f, 1.f));
+
+    Float g = parameters.GetOneFloat("g", 0.);
+    Spectrum sigma_a =
+        parameters.GetOneSpectrum("sigma_a", nullptr, SpectrumType::Unbounded, alloc);
+    if (!sigma_a)
+        sigma_a = alloc.new_object<ConstantSpectrum>(1.f);
+    Spectrum sigma_s =
+        parameters.GetOneSpectrum("sigma_s", nullptr, SpectrumType::Unbounded, alloc);
+    if (!sigma_s)
+        sigma_s = alloc.new_object<ConstantSpectrum>(1.f);
+    Float sigmaScale = parameters.GetOneFloat("scale", 1.f);
+
+    Float temperatureOffset = parameters.GetOneFloat("temperatureoffset",
+                                                     parameters.GetOneFloat("temperaturecutoff", 0.f));
+    Float temperatureScale = parameters.GetOneFloat("temperaturescale", 1.f);
+
+    return alloc.new_object<DeltaGridMedium>(
+        Bounds3f(p0, p1), renderFromMedium, sigma_a, sigma_s, sigmaScale, g,
+        std::move(densityGrid_old), std::move(densityGrid_new), std::move(temperatureGrid), temperatureScale,
+        temperatureOffset, Le, std::move(LeGrid), alloc);
+}
+
+std::string DeltaGridMedium::ToString() const {
+    return StringPrintf("[ DeltaGridMedium bounds: %s renderFromMedium: %s phase: %s "
+                        "LeScale: %s Resolution: %d %d %d (grids elided) ]",
+                        bounds, renderFromMedium, phase, LeScale, densityGrid_old.XSize(), densityGrid_old.YSize(), densityGrid_old.ZSize());
+}
+
 // RGBGridMedium Method Definitions
 RGBGridMedium::RGBGridMedium(const Bounds3f &bounds, const Transform &renderFromMedium,
                              Float g,
@@ -678,6 +816,8 @@ Medium Medium::Create(const std::string &name, const ParameterDictionary &parame
         m = CloudMedium::Create(parameters, renderFromMedium, loc, alloc);
     } else if (name == "nanovdb") {
         m = NanoVDBMedium::Create(parameters, renderFromMedium, loc, alloc);
+    } else if (name == "deltagrid") {
+        m = DeltaGridMedium::Create(parameters, renderFromMedium, loc, alloc);
     } else
         ErrorExit(loc, "%s: medium unknown.", name);
 
